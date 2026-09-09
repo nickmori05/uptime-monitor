@@ -17,7 +17,13 @@ class Endpoint(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/slow":
             time.sleep(0.3)
-        status = {"/ok": 200, "/fail": 503, "/redirect": 302, "/slow": 200}.get(self.path, 404)
+        status = {
+            "/ok": 200,
+            "/empty": 204,
+            "/fail": 503,
+            "/redirect": 302,
+            "/slow": 200,
+        }.get(self.path, 404)
         self.send_response(status)
         if self.path == "/redirect":
             self.send_header("Location", "/ok")
@@ -131,6 +137,11 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(rows[0]["status_code"], 503)
         with redirect_stderr(io.StringIO()):
             self.assertEqual(monitor.main(args + ["check", "invalid"]), 2)
+    def test_204_is_up(self):
+        result = monitor.probe(self.base_url + "/empty")
+        self.assertEqual(result.state, "up")
+        self.assertEqual(result.status_code, 204)
+
 
 
 if __name__ == "__main__":
