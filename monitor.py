@@ -1,5 +1,3 @@
-"""Check an HTTP endpoint and keep a local history. Python 3.10+."""
-
 import argparse
 from contextlib import closing
 from dataclasses import asdict, dataclass
@@ -8,6 +6,7 @@ import http.client
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
 import sys
 from time import perf_counter
@@ -31,7 +30,6 @@ class Check:
 
 class NoRedirects(HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
-        # Measure this exact endpoint, not another endpoint named in Location.
         return None
 
 
@@ -55,10 +53,15 @@ def validate_url(value: str) -> str:
     return value
 
 
-def probe(url: str, timeout: float = 5.0) -> Check:
-    url = validate_url(url)
+def validate_timeout(timeout: float) -> float:
     if not math.isfinite(timeout) or not 0 < timeout <= 60:
         raise ValueError("Timeout must be greater than 0 and at most 60 seconds.")
+    return timeout
+
+
+def probe(url: str, timeout: float = 5.0) -> Check:
+    url = validate_url(url)
+    timeout = validate_timeout(timeout)
     started_at = datetime.now(timezone.utc).isoformat()
     started = perf_counter()
     status = None
@@ -67,8 +70,6 @@ def probe(url: str, timeout: float = 5.0) -> Check:
     try:
         with build_opener(NoRedirects()).open(request, timeout=timeout) as response:
             status = response.status
-            # Headers are sufficient for this first check. Do not download a
-            # potentially large or indefinitely streaming response body.
     except HTTPError as response:
         status = response.code
         response.close()
@@ -106,6 +107,14 @@ def connect(database: Path) -> sqlite3.Connection:
             error TEXT
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS targets (
+            name TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            timeout REAL NOT NULL CHECK(timeout > 0 AND timeout <= 60)
+        )"""
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS checks_url_id ON checks(url, id)")
     connection.commit()
     return connection
 
@@ -120,9 +129,16 @@ def save(connection: sqlite3.Connection, result: Check) -> int:
     return cursor.lastrowid
 
 
-def history(connection: sqlite3.Connection, limit: int = 20) -> list[dict]:
+def history(connection: sqlite3.Connection, limit: int = 20, url: str | None = None) -> list[dict]:
     if not 1 <= limit <= 1000:
         raise ValueError("History limit must be between 1 and 1000.")
+    if url is not None:
+        url = validate_url(url)
+        return [
+            dict(row) for row in connection.execute(
+                "SELECT * FROM checks WHERE url = ? ORDER BY id DESC LIMIT ?", (url, limit)
+            )
+        ]
     return [
         dict(row) for row in connection.execute(
             "SELECT * FROM checks ORDER BY id DESC LIMIT ?", (limit,)
@@ -130,8 +146,33 @@ def history(connection: sqlite3.Connection, limit: int = 20) -> list[dict]:
     ]
 
 
+def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: float = 5.0) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
+        raise ValueError("Name must be 1–64 letters, digits, hyphens, or underscores, starting with a letter or digit.")
+    url = validate_url(url)
+    timeout = validate_timeout(timeout)
+    try:
+        with connection:
+            connection.execute("INSERT INTO targets (name, url, timeout) VALUES (?, ?, ?)",
+                               (name, url, timeout))
+    except sqlite3.IntegrityError as error:
+        raise ValueError(f"A target named '{name}' already exists.") from error
+    return {"name": name, "url": url, "timeout": timeout}
+
+
+def get_target(connection: sqlite3.Connection, name: str) -> dict:
+    row = connection.execute("SELECT * FROM targets WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        raise ValueError(f"Target '{name}' does not exist.")
+    return dict(row)
+
+
+def list_targets(connection: sqlite3.Connection) -> list[dict]:
+    return [dict(row) for row in connection.execute("SELECT * FROM targets ORDER BY name")]
+
+
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description=__doc__)
+    root = argparse.ArgumentParser(description="Check HTTP endpoints and keep a local history.")
     root.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
     commands = root.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check", help="Check a URL once and save the result")
@@ -139,6 +180,14 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--timeout", type=float, default=5.0, help="Socket timeout in seconds (default: 5)")
     listing = commands.add_parser("history", help="Show recent saved checks as JSON")
     listing.add_argument("--limit", type=int, default=20)
+    listing.add_argument("--url", help="Only show checks for this exact URL")
+    add = commands.add_parser("add", help="Save a named target without making a request")
+    add.add_argument("name")
+    add.add_argument("url")
+    add.add_argument("--timeout", type=float, default=5.0)
+    commands.add_parser("targets", help="List saved targets")
+    run = commands.add_parser("run", help="Check one saved target and record the result")
+    run.add_argument("name")
     return root
 
 
@@ -147,9 +196,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with closing(connect(args.database)) as connection:
             if args.command == "history":
-                print(json.dumps(history(connection, args.limit), indent=2))
+                print(json.dumps(history(connection, args.limit, args.url), indent=2))
                 return 0
-            result = probe(args.url, args.timeout)
+            if args.command == "add":
+                print(json.dumps(add_target(connection, args.name, args.url, args.timeout), indent=2))
+                return 0
+            if args.command == "targets":
+                print(json.dumps(list_targets(connection), indent=2))
+                return 0
+            if args.command == "run":
+                target = get_target(connection, args.name)
+                result = probe(target["url"], target["timeout"])
+            else:
+                result = probe(args.url, args.timeout)
             identifier = save(connection, result)
             print(json.dumps({"id": identifier, **asdict(result)}, indent=2))
             return 0 if result.state == "up" else 1

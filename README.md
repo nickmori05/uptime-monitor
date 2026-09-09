@@ -1,5 +1,7 @@
 # Uptime Monitor
 
+[![Tests](https://github.com/nickmori05/uptime-monitor/actions/workflows/tests.yml/badge.svg)](https://github.com/nickmori05/uptime-monitor/actions/workflows/tests.yml)
+
 Check an HTTP endpoint, record its response time, and inspect its history.
 The first version is a local Python command-line tool with SQLite storage and
 no external package dependencies.
@@ -34,6 +36,24 @@ python3 monitor.py check https://example.com --timeout 3
 It is not a guaranteed deadline for the whole operation: DNS resolution and
 multiple network steps may take additional time.
 
+## Named targets
+
+Save an endpoint and its timeout once, then run checks by name:
+
+```sh
+python3 monitor.py add example https://example.com --timeout 3
+python3 monitor.py targets
+python3 monitor.py run example
+python3 monitor.py history --url https://example.com --limit 5
+```
+
+`add` saves configuration without sending a request. `run` makes one check,
+persists the result, and uses the same exit codes as `check`. Names are case
+sensitive and contain 1–64 ASCII letters, digits, underscores, or hyphens;
+the first character must be a letter or digit. Duplicate names are rejected
+without changing the existing configuration. History filtering matches the
+exact saved URL, including its path and query string.
+
 ## Storage
 
 Results are saved in `.local/checks.sqlite3` next to the script. The database is
@@ -57,6 +77,8 @@ The test suite uses a temporary local HTTP server and temporary databases.
 It checks HTTP success, server failure, redirects, timeouts, persistence,
 history ordering, input validation, and command-line exit codes. Connection
 failure is injected so that it does not depend on external networking.
+Target tests cover persisted settings, duplicate names, invalid configuration,
+configured timeouts, failed checks, and URL-filtered history.
 
 GitHub Actions runs the suite on Python 3.10 and 3.14.
 
@@ -64,6 +86,7 @@ GitHub Actions runs the suite on Python 3.10 and 3.14.
 
 - `probe`: make one request and classify the observation.
 - `save` and `history`: persist and retrieve observations using SQLite.
+- `add_target`, `get_target`, and `list_targets`: manage reusable check settings.
 - `main`: parse commands, print JSON, and return exit codes.
 
 SQLite keeps the initial local workflow reproducible. A future shared service
@@ -75,13 +98,12 @@ The current release runs one check at a time, when invoked. It has no scheduled
 checks, alerts, dashboard, or hosted API, and it does not calculate uptime
 percentages from sparse manual observations.
 
-Planned milestones:
+Next milestones:
 
-1. Give saved monitors names and retain their URL and check settings.
-2. Schedule checks with bounded concurrency and predictable shutdown.
-3. Model incidents from consecutive failures and recoveries.
-4. Add an API and a small dashboard for viewing results.
-5. Add alert deduplication and measured reliability tests.
+1. Schedule checks with bounded concurrency and predictable shutdown.
+2. Model incidents from consecutive failures and recoveries.
+3. Add an API and a small dashboard for viewing results.
+4. Add alert deduplication and measured reliability tests.
 
 Each milestone should ship with a working example, relevant tests, and an
 explanation of its design choices. Start with one complete feature at a time.
