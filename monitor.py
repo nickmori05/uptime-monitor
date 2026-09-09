@@ -1,5 +1,3 @@
-"""Check an HTTP endpoint and keep a local history. Python 3.10+."""
-
 import argparse
 from contextlib import closing
 from dataclasses import asdict, dataclass
@@ -32,7 +30,6 @@ class Check:
 
 class NoRedirects(HTTPRedirectHandler):
     def redirect_request(self, request, response, code, message, headers, new_url):
-        # Measure this exact endpoint, not another endpoint named in Location.
         return None
 
 
@@ -73,8 +70,6 @@ def probe(url: str, timeout: float = 5.0) -> Check:
     try:
         with build_opener(NoRedirects()).open(request, timeout=timeout) as response:
             status = response.status
-            # Headers are sufficient for this first check. Do not download a
-            # potentially large or indefinitely streaming response body.
     except HTTPError as response:
         status = response.code
         response.close()
@@ -177,7 +172,7 @@ def list_targets(connection: sqlite3.Connection) -> list[dict]:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description=__doc__)
+    root = argparse.ArgumentParser(description="Check HTTP endpoints and keep a local history.")
     root.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
     commands = root.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check", help="Check a URL once and save the result")
