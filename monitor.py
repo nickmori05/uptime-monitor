@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -171,6 +172,31 @@ def list_targets(connection: sqlite3.Connection) -> list[dict]:
     return [dict(row) for row in connection.execute("SELECT * FROM targets ORDER BY name")]
 
 
+def run_targets(connection: sqlite3.Connection, workers: int = 4) -> list[dict]:
+    if type(workers) is not int or not 1 <= workers <= 32:
+        raise ValueError("Workers must be between 1 and 32.")
+    targets = list_targets(connection)
+    for target in targets:
+        validate_url(target["url"])
+        validate_timeout(target["timeout"])
+    if not targets:
+        return []
+    pool = ThreadPoolExecutor(max_workers=workers)
+    results = []
+    try:
+        pending = {
+            pool.submit(probe, target["url"], target["timeout"]): target["name"]
+            for target in targets
+        }
+        for future in as_completed(pending):
+            result = future.result()
+            identifier = save(connection, result)
+            results.append({"target": pending[future], "id": identifier, **asdict(result)})
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return sorted(results, key=lambda row: row["target"])
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Check HTTP endpoints and keep a local history.")
     root.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
@@ -188,6 +214,8 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("targets", help="List saved targets")
     run = commands.add_parser("run", help="Check one saved target and record the result")
     run.add_argument("name")
+    batch = commands.add_parser("run-all", help="Check all saved targets with bounded concurrency")
+    batch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
     return root
 
 
@@ -204,6 +232,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "targets":
                 print(json.dumps(list_targets(connection), indent=2))
                 return 0
+            if args.command == "run-all":
+                results = run_targets(connection, args.workers)
+                print(json.dumps(results, indent=2))
+                return 1 if any(row["state"] == "down" for row in results) else 0
             if args.command == "run":
                 target = get_target(connection, args.name)
                 result = probe(target["url"], target["timeout"])
@@ -215,6 +247,9 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError, sqlite3.Error) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
