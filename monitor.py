@@ -172,6 +172,14 @@ def list_targets(connection: sqlite3.Connection) -> list[dict]:
     return [dict(row) for row in connection.execute("SELECT * FROM targets ORDER BY name")]
 
 
+def remove_target(connection: sqlite3.Connection, name: str) -> dict:
+    with connection:
+        cursor = connection.execute("DELETE FROM targets WHERE name = ?", (name,))
+        if cursor.rowcount == 0:
+            raise ValueError(f"Target '{name}' does not exist.")
+    return {"removed": name}
+
+
 def run_targets(connection: sqlite3.Connection, workers: int = 4) -> list[dict]:
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("Workers must be between 1 and 32.")
@@ -212,6 +220,8 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("url")
     add.add_argument("--timeout", type=float, default=5.0)
     commands.add_parser("targets", help="List saved targets")
+    remove = commands.add_parser("remove", help="Remove a saved target without deleting its history")
+    remove.add_argument("name")
     run = commands.add_parser("run", help="Check one saved target and record the result")
     run.add_argument("name")
     batch = commands.add_parser("run-all", help="Check all saved targets with bounded concurrency")
@@ -231,6 +241,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "targets":
                 print(json.dumps(list_targets(connection), indent=2))
+                return 0
+            if args.command == "remove":
+                print(json.dumps(remove_target(connection, args.name), indent=2))
                 return 0
             if args.command == "run-all":
                 results = run_targets(connection, args.workers)
