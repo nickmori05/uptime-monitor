@@ -55,6 +55,16 @@ the first character must be a letter or digit. Duplicate names are rejected
 without changing the existing configuration. History filtering matches the
 exact saved URL, including its path and query string.
 
+Remove a target you no longer want to check:
+
+```sh
+python3 monitor.py remove example
+```
+
+`remove` deletes only the saved configuration and prints `{"removed": "example"}`.
+Past checks remain in history. Missing names return exit code `2`. A batch that
+already loaded its targets may still finish checking a removed target.
+
 ## Check all saved targets
 
 ```sh
@@ -103,7 +113,8 @@ It checks HTTP success, server failure, redirects, timeouts, persistence,
 history ordering, input validation, and command-line exit codes. Connection
 failure is injected so that it does not depend on external networking.
 Target tests cover persisted settings, duplicate names, invalid configuration,
-configured timeouts, failed checks, and URL-filtered history.
+configured timeouts, failed checks, URL-filtered history, and target removal
+without losing past checks.
 Batch tests verify overlapping requests, the worker limit, writes on the calling
 thread, mixed results, and CLI exit codes. Concurrency is checked with a barrier
 rather than by comparing wall-clock timings.
@@ -114,7 +125,7 @@ GitHub Actions runs the suite on Python 3.10 and 3.14.
 
 - `probe`: make one request and classify the observation.
 - `save` and `history`: persist and retrieve observations using SQLite.
-- `add_target`, `get_target`, and `list_targets`: manage reusable check settings.
+- `add_target`, `get_target`, `list_targets`, and `remove_target`: manage reusable check settings.
 - `run_targets`: run requests concurrently and save completed checks on the caller's connection.
 - `main`: parse commands, print JSON, and return exit codes.
 
