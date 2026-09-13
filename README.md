@@ -141,6 +141,52 @@ if a target was removed. Gaps between checks are unknown. Reports scan all
 matching observations, so they are intended for local-sized histories. This is
 not an alerting system or a measurement of exact outage duration.
 
+## Docker
+
+```sh
+docker compose build
+docker compose run --rm monitor add example https://example.com --timeout 3
+docker compose up -d monitor
+docker compose logs -f monitor
+```
+
+The service checks saved targets every 30 seconds after each batch finishes.
+It runs as a non-root user with a read-only filesystem, except for `/data` and
+`/tmp`. The named `monitor-data` volume stores the database. Container recreation
+and `docker compose down` preserve it. `docker compose down --volumes` deletes it.
+The container database is separate from the default local Python database.
+
+Use another container to inspect or change the same stored data:
+
+```sh
+docker compose run --rm monitor history --limit 10
+docker compose run --rm monitor incidents --state open
+docker compose run --rm monitor remove example
+docker compose stop monitor
+```
+
+Add at least one target before starting the watcher. It exits when no targets
+remain and does not automatically restart; after adding new targets, run
+`docker compose up -d monitor` again. No inbound ports are published. Inside the
+container, `localhost` refers to the container, so target URLs must be reachable
+from its network.
+
+Compose sends SIGTERM and allows 75 seconds before forcing shutdown. Committed
+checks remain in the volume, but an active request can still exceed this grace
+period because socket timeouts do not bound the whole operation.
+
+Run the container integration check with Docker and Compose available:
+
+```sh
+python3 scripts/docker_smoke.py
+```
+
+It builds an isolated image, uses a temporary Compose project and volume, and
+checks two failures followed by two recoveries against a fixture on an internal
+network. It also checks non-root execution, persistence across containers, and
+SIGTERM shutdown. Its temporary containers, network, volume, and image are
+removed afterward; your regular monitor volume is not used.
+
 ## Storage
 
 Results are saved in `.local/checks.sqlite3` next to the script. The database is
@@ -175,7 +221,7 @@ Watch tests cover target reloads, wait placement, streamed output, saved results
 after interruption, and real process shutdown using SIGINT and SIGTERM. Incident
 tests cover independent streaks, recovery, filtering, persistence, and clock changes.
 
-GitHub Actions runs the suite on Python 3.10 and 3.14.
+GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration check.
 
 ## Structure
 
