@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import http.client
 import json
+from incidents import list_incidents
 import math
 from pathlib import Path
 import re
@@ -226,6 +227,12 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("name")
     batch = commands.add_parser("run-all", help="Check all saved targets with bounded concurrency")
     batch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
+    incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
+    incidents.add_argument("--url", type=validate_url, help="Only report this exact URL")
+    incidents.add_argument("--state", choices=("open", "resolved"))
+    incidents.add_argument("--limit", type=int, default=20)
+    incidents.add_argument("--failures", type=int, default=2, help="Consecutive failures to open an incident")
+    incidents.add_argument("--recoveries", type=int, default=2, help="Consecutive successes to resolve it")
     return root
 
 
@@ -233,6 +240,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         with closing(connect(args.database)) as connection:
+            if args.command == "incidents":
+                results = list_incidents(
+                    connection, url=args.url, state=args.state, limit=args.limit,
+                    failures=args.failures, recoveries=args.recoveries,
+                )
+                print(json.dumps(results, indent=2))
+                return 0
             if args.command == "history":
                 print(json.dumps(history(connection, args.limit, args.url), indent=2))
                 return 0

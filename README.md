@@ -89,6 +89,33 @@ active requests finish. Already committed observations remain in history.
 The socket timeout is still not a whole-operation deadline, so an active DNS
 lookup or request may delay shutdown. There is no recurring schedule yet.
 
+## Incident reports
+
+```sh
+python3 monitor.py incidents
+python3 monitor.py incidents --state open --url https://example.com
+python3 monitor.py incidents --failures 3 --recoveries 2 --limit 10
+```
+
+By default, two consecutive failed observations open an incident and two
+consecutive successful observations resolve it. One success followed by another
+failure keeps the same incident open. `opened_at` is the first failure;
+`confirmed_at` is the failure that reaches the threshold. `resolved_at` is the
+success that confirms recovery. The report includes the matching check IDs.
+
+Reports are reconstructed from saved checks in insertion order, grouped by exact
+URL. Checks from every command and target alias count. Changing the thresholds
+reinterprets that history; it does not edit records. Results are newest incident
+first, with URL and state filters applied before the limit (maximum 1,000).
+Thresholds must be between 1 and 100. Reporting succeeds with exit code `0`, even
+when incidents are open.
+
+An open incident means recovery has not been confirmed in the saved history.
+It does not prove an endpoint is still down: check `last_checked_at`, especially
+if a target was removed. Gaps between checks are unknown. Reports scan all
+matching observations, so they are intended for local-sized histories. This is
+not an alerting system or a measurement of exact outage duration.
+
 ## Storage
 
 Results are saved in `.local/checks.sqlite3` next to the script. The database is
@@ -127,6 +154,7 @@ GitHub Actions runs the suite on Python 3.10 and 3.14.
 - `save` and `history`: persist and retrieve observations using SQLite.
 - `add_target`, `get_target`, `list_targets`, and `remove_target`: manage reusable check settings.
 - `run_targets`: run requests concurrently and save completed checks on the caller's connection.
+- `list_incidents`: derive failure and recovery episodes from saved observations.
 - `main`: parse commands, print JSON, and return exit codes.
 
 SQLite keeps the initial local workflow reproducible. A future shared service
@@ -141,7 +169,6 @@ percentages from sparse manual observations.
 Next milestones:
 
 1. Schedule repeated batches and add an explicit total-request deadline.
-2. Model incidents from consecutive failures and recoveries.
 3. Add an API and a small dashboard for viewing results.
 4. Add alert deduplication and measured reliability tests.
 
