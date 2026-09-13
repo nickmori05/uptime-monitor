@@ -10,8 +10,9 @@ import math
 from pathlib import Path
 import re
 import sqlite3
+import signal
 import sys
-from time import perf_counter
+from time import perf_counter, sleep
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -206,6 +207,32 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4) -> list[dict]:
     return sorted(results, key=lambda row: row["target"])
 
 
+def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
+                  count: int | None = None, workers: int = 4):
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not math.isfinite(interval) or not 1 <= interval <= 86400:
+        raise ValueError("Interval must be between 1 and 86400 seconds.")
+    if count is not None and (type(count) is not int or count < 1):
+        raise ValueError("Count must be a positive integer.")
+    if type(workers) is not int or not 1 <= workers <= 32:
+        raise ValueError("Workers must be between 1 and 32.")
+    cycle = 0
+    while True:
+        results = run_targets(connection, workers)
+        cycle += 1
+        yield {"cycle": cycle, "results": results}
+        if not results or (count is not None and cycle >= count):
+            return
+        sleep(interval)
+
+
+class ShutdownRequested(BaseException):
+    pass
+
+
+def terminate(signum, frame):
+    raise ShutdownRequested()
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Check HTTP endpoints and keep a local history.")
     root.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
@@ -227,6 +254,10 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("name")
     batch = commands.add_parser("run-all", help="Check all saved targets with bounded concurrency")
     batch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
+    watch = commands.add_parser("watch", help="Repeat batches until stopped or the count is reached")
+    watch.add_argument("--workers", type=int, default=4)
+    watch.add_argument("--interval", type=float, default=30.0, help="Seconds to wait after each batch")
+    watch.add_argument("--count", type=int, help="Number of batches; omit to keep watching")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=validate_url, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"))
@@ -240,6 +271,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         with closing(connect(args.database)) as connection:
+            if args.command == "watch":
+                failed = False
+                for batch in watch_targets(connection, interval=args.interval, count=args.count, workers=args.workers):
+                    failed = failed or any(row["state"] == "down" for row in batch["results"])
+                    print(json.dumps(batch), flush=True)
+                return 1 if failed else 0
             if args.command == "incidents":
                 results = list_incidents(
                     connection, url=args.url, state=args.state, limit=args.limit,
@@ -274,10 +311,14 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError, sqlite3.Error) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2
+    except ShutdownRequested:
+        print("Stopped.", file=sys.stderr)
+        return 143
     except KeyboardInterrupt:
         print("\nCancelled.", file=sys.stderr)
         return 130
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, terminate)
     raise SystemExit(main())
