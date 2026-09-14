@@ -55,6 +55,20 @@ the first character must be a letter or digit. Duplicate names are rejected
 without changing the existing configuration. History filtering matches the
 exact saved URL, including its path and query string.
 
+Change an existing target without removing it:
+
+```sh
+python3 monitor.py update example --timeout 2
+python3 monitor.py update example --url https://example.com/health --timeout 3
+```
+
+Supply `--url`, `--timeout`, or both. Omitted settings stay unchanged. Updates
+print the saved settings as JSON without making a request. Invalid values or
+missing names return exit code `2` and leave the configuration unchanged.
+Past checks and incidents remain tied to their original URL. A running watcher
+loads the updated settings on its next round; a batch already in progress keeps
+its original settings.
+
 Remove a target you no longer want to check:
 
 ```sh
@@ -227,7 +241,7 @@ GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration
 
 - `probe`: make one request and classify the observation.
 - `save` and `history`: persist and retrieve observations using SQLite.
-- `add_target`, `get_target`, `list_targets`, and `remove_target`: manage reusable check settings.
+- `add_target`, `get_target`, `list_targets`, `update_target`, and `remove_target`: manage reusable check settings.
 - `run_targets`: run requests concurrently and save completed checks on the caller's connection.
 - `watch_targets`: repeat batches with a delay and fresh settings each round.
 - `list_incidents`: derive failure and recovery episodes from saved observations.
