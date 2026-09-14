@@ -54,6 +54,21 @@ class WatchTests(unittest.TestCase):
         self.assertEqual([b["results"][0]["target"] for b in batches], ["api", "new-api"])
         self.assertEqual(probe.call_args.args, ("https://new.example", 2))
 
+    def test_watcher_picks_up_updated_settings_next_round(self):
+        def update_settings(seconds):
+            connection = monitor.connect(self.database)
+            try:
+                monitor.update_target(connection, "api", timeout=2)
+            finally:
+                connection.close()
+
+        with patch.object(monitor, "probe", return_value=self.result()) as probe, \
+                patch.object(monitor, "sleep", side_effect=update_settings):
+            batches = list(monitor.watch_targets(self.connection, count=2))
+        self.assertEqual([call.args for call in probe.call_args_list],
+                         [("https://example.com", 5), ("https://example.com", 2)])
+        self.assertEqual(len(batches), 2)
+
     def test_empty_target_list_exits_without_waiting(self):
         monitor.remove_target(self.connection, "api")
         with patch.object(monitor, "probe") as probe, patch.object(monitor, "sleep") as sleep:

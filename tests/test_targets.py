@@ -30,6 +30,60 @@ class TargetTests(unittest.TestCase):
             monitor.add_target(self.connection, "api", "https://other.example.com", 3)
         self.assertEqual(monitor.get_target(self.connection, "api"), original)
 
+    def test_cli_updates_selected_settings_and_preserves_history(self):
+        url = "https://example.com/health"
+        monitor.add_target(self.connection, "api", url, 5)
+        other = monitor.add_target(self.connection, "website", "https://example.com")
+        monitor.save(self.connection, monitor.Check(url, "2026-09-14T00:00:00+00:00", "up", 200, 1.0, None))
+        before = monitor.history(self.connection)
+        for flags, expected_url, expected_timeout in (
+            (["--timeout", "2"], url, 2),
+            (["--url", "https://new.example.com"], "https://new.example.com", 2),
+            (["--url", url, "--timeout", "3"], url, 3),
+        ):
+            with self.subTest(flags=flags), patch("monitor.probe") as probe:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = monitor.main(["--database", str(self.database), "update", "api", *flags])
+                self.assertEqual(code, 0)
+                expected = {"name": "api", "url": expected_url, "timeout": expected_timeout}
+                self.assertEqual(json.loads(output.getvalue()), expected)
+                reopened = monitor.connect(self.database)
+                try:
+                    self.assertEqual(monitor.get_target(reopened, "api"), expected)
+                    self.assertEqual(monitor.get_target(reopened, "website"), other)
+                    self.assertEqual(monitor.history(reopened), before)
+                finally:
+                    reopened.close()
+                probe.assert_not_called()
+
+    def test_invalid_updates_leave_all_settings_unchanged(self):
+        original = monitor.add_target(self.connection, "api", "https://example.com", 5)
+        for flags in ([], ["--timeout", "0"], ["--timeout", "nan"], ["--timeout", "inf"],
+                      ["--timeout", "61"], ["--url", "file:///etc/hosts", "--timeout", "2"],
+                      ["--url", "https://new.example.com", "--timeout", "-1"]):
+            with self.subTest(flags=flags), patch("monitor.probe") as probe, \
+                    redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                self.assertEqual(monitor.main(["--database", str(self.database), "update", "api", *flags]), 2)
+                self.assertEqual(monitor.get_target(self.connection, "api"), original)
+                probe.assert_not_called()
+
+    def test_update_requires_an_existing_exact_name(self):
+        original = monitor.add_target(self.connection, "api", "https://example.com")
+        for name in ("missing", "API", "api' OR 1=1 --"):
+            with self.subTest(name=name), redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                self.assertEqual(monitor.main(["--database", str(self.database), "update", name, "--timeout", "2"]), 2)
+                self.assertEqual(monitor.list_targets(self.connection), [original])
+
+    def test_run_uses_updated_configuration(self):
+        monitor.add_target(self.connection, "api", "https://example.com")
+        monitor.update_target(self.connection, "api", url="https://example.com/health", timeout=2)
+        result = monitor.Check("https://example.com/health", "2026-09-14T00:00:00+00:00", "up", 200, 1.0, None)
+        with patch("monitor.probe", return_value=result) as probe, redirect_stdout(io.StringIO()):
+            self.assertEqual(monitor.main(["--database", str(self.database), "run", "api"]), 0)
+        probe.assert_called_once_with("https://example.com/health", 2)
+        self.assertEqual(monitor.history(self.connection)[0]["url"], result.url)
+
     def test_cli_remove_preserves_history_and_other_targets(self):
         url = "https://example.com/health"
         monitor.add_target(self.connection, "api", url)

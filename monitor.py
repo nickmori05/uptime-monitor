@@ -174,6 +174,25 @@ def list_targets(connection: sqlite3.Connection) -> list[dict]:
     return [dict(row) for row in connection.execute("SELECT * FROM targets ORDER BY name")]
 
 
+def update_target(connection: sqlite3.Connection, name: str, *,
+                  url: str | None = None, timeout: float | None = None) -> dict:
+    if url is None and timeout is None:
+        raise ValueError("Provide a URL or timeout to update.")
+    if url is not None:
+        url = validate_url(url)
+    if timeout is not None:
+        timeout = validate_timeout(timeout)
+    with connection:
+        cursor = connection.execute(
+            "UPDATE targets SET url = COALESCE(?, url), timeout = COALESCE(?, timeout) WHERE name = ?",
+            (url, timeout, name),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError(f"Target '{name}' does not exist.")
+        target = get_target(connection, name)
+    return target
+
+
 def remove_target(connection: sqlite3.Connection, name: str) -> dict:
     with connection:
         cursor = connection.execute("DELETE FROM targets WHERE name = ?", (name,))
@@ -247,6 +266,10 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("name")
     add.add_argument("url")
     add.add_argument("--timeout", type=float, default=5.0)
+    update = commands.add_parser("update", help="Change a saved target's URL or timeout")
+    update.add_argument("name")
+    update.add_argument("--url")
+    update.add_argument("--timeout", type=float)
     commands.add_parser("targets", help="List saved targets")
     remove = commands.add_parser("remove", help="Remove a saved target without deleting its history")
     remove.add_argument("name")
@@ -292,6 +315,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "targets":
                 print(json.dumps(list_targets(connection), indent=2))
+                return 0
+            if args.command == "update":
+                target = update_target(connection, args.name, url=args.url, timeout=args.timeout)
+                print(json.dumps(target, indent=2))
                 return 0
             if args.command == "remove":
                 print(json.dumps(remove_target(connection, args.name), indent=2))
