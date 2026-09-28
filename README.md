@@ -155,6 +155,32 @@ if a target was removed. Gaps between checks are unknown. Reports scan all
 matching observations, so they are intended for local-sized histories. This is
 not an alerting system or a measurement of exact outage duration.
 
+## Check summaries
+
+After leaving the watcher running, use `summary` to see how each endpoint did:
+
+```sh
+python3 monitor.py summary
+python3 monitor.py summary --url https://example.com --last 50
+```
+
+The default sample is the last 100 saved checks **per URL**. `--last` accepts
+1–10,000. Results include total stored checks, sampled checks, up/down counts,
+the latest result, and average/minimum/maximum latency for successful checks.
+Timeouts and other failures count as down but aren't mixed into those latency
+figures. If every sampled check failed, the latency fields are `null`.
+
+URLs are matched exactly and returned alphabetically. Two target names pointing
+to the same URL share one summary. Removing a target keeps its saved results.
+An empty database or unmatched URL returns `[]`. The command makes no requests
+and exits `0` even when the saved results include failures.
+
+The sample uses insertion order, so a clock change won't reorder checks. These
+are observed results, not an uptime percentage or a claim that an endpoint is
+healthy now. There may be long gaps between checks. A large stored history can
+take time to summarize; the sample limit bounds the report's input per endpoint,
+but the query still examines matching history to rank and count it.
+
 ## Docker
 
 ```sh
@@ -234,6 +260,8 @@ rather than by comparing wall-clock timings.
 Watch tests cover target reloads, wait placement, streamed output, saved results
 after interruption, and real process shutdown using SIGINT and SIGTERM. Incident
 tests cover independent streaks, recovery, filtering, persistence, and clock changes.
+Summary tests cover per-URL samples, successful-response latency, empty results,
+exact URL matching, clock changes, and reading history without making requests.
 
 GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration check.
 
@@ -241,6 +269,7 @@ GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration
 
 - `probe`: make one request and classify the observation.
 - `save` and `history`: persist and retrieve observations using SQLite.
+- `summarize`: group recent saved observations by URL for a quick health report.
 - `add_target`, `get_target`, `list_targets`, `update_target`, and `remove_target`: manage reusable check settings.
 - `run_targets`: run requests concurrently and save completed checks on the caller's connection.
 - `watch_targets`: repeat batches with a delay and fresh settings each round.

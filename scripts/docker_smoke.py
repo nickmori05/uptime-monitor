@@ -42,6 +42,14 @@ def main():
         assert incident["failed_checks"] == 2, incident
         assert incident["resolution_check_id"] == batches[-1]["results"][0]["id"], incident
         assert len(json.loads(command("history"))) == 4
+        summary, = json.loads(command("summary", "--url", "http://fixture:8000/service"))
+        assert (summary["stored_checks"], summary["up_checks"], summary["down_checks"]) == (4, 2, 2), summary
+        assert summary["latest_state"] == "up" and summary["latest_error"] is None, summary
+        recent, = json.loads(command("summary", "--last", "2"))
+        assert recent["sampled_checks"] == 2 and recent["down_checks"] == 0, recent
+        assert recent["stored_checks"] == 4, recent
+        assert recent["up_min_latency_ms"] <= recent["up_avg_latency_ms"] <= recent["up_max_latency_ms"], recent
+        assert len(json.loads(command("history"))) == 4
         print("Failure, recovery, and persistence across containers passed.", flush=True)
 
         run(["up", "--detach", "--no-deps", "monitor"])

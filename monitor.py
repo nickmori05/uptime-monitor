@@ -149,6 +149,34 @@ def history(connection: sqlite3.Connection, limit: int = 20, url: str | None = N
     ]
 
 
+def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None = None) -> list[dict]:
+    if type(last) is not int or not 1 <= last <= 10000:
+        raise ValueError("Summary sample size must be between 1 and 10000.")
+    if url is not None:
+        url = validate_url(url)
+    where = " WHERE url = ?" if url is not None else ""
+    values = (url, last) if url is not None else (last,)
+    rows = connection.execute(
+        """WITH ranked AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY url ORDER BY id DESC) AS position,
+                   COUNT(*) OVER (PARTITION BY url) AS stored_checks
+            FROM checks""" + where + """
+        )
+        SELECT url, MAX(stored_checks) AS stored_checks, COUNT(*) AS sampled_checks,
+               SUM(state = 'up') AS up_checks, SUM(state = 'down') AS down_checks,
+               MAX(CASE WHEN position = 1 THEN id END) AS latest_id,
+               MAX(CASE WHEN position = 1 THEN checked_at END) AS latest_checked_at,
+               MAX(CASE WHEN position = 1 THEN state END) AS latest_state,
+               MAX(CASE WHEN position = 1 THEN error END) AS latest_error,
+               MAX(CASE WHEN position = 1 THEN status_code END) AS latest_status_code,
+               ROUND(AVG(CASE WHEN state = 'up' THEN latency_ms END), 3) AS up_avg_latency_ms,
+               MIN(CASE WHEN state = 'up' THEN latency_ms END) AS up_min_latency_ms,
+               MAX(CASE WHEN state = 'up' THEN latency_ms END) AS up_max_latency_ms
+        FROM ranked WHERE position <= ? GROUP BY url ORDER BY url""", values,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: float = 5.0) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
         raise ValueError("Name must be 1–64 letters, digits, hyphens, or underscores, starting with a letter or digit.")
@@ -262,6 +290,9 @@ def parser() -> argparse.ArgumentParser:
     listing = commands.add_parser("history", help="Show recent saved checks as JSON")
     listing.add_argument("--limit", type=int, default=20)
     listing.add_argument("--url", help="Only show checks for this exact URL")
+    summary = commands.add_parser("summary", help="Summarize saved checks per endpoint without making requests")
+    summary.add_argument("--last", type=int, default=100, help="Recent checks per URL, 1–10000 (default: 100)")
+    summary.add_argument("--url", help="Only summarize this exact URL")
     add = commands.add_parser("add", help="Save a named target without making a request")
     add.add_argument("name")
     add.add_argument("url")
@@ -309,6 +340,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "history":
                 print(json.dumps(history(connection, args.limit, args.url), indent=2))
+                return 0
+            if args.command == "summary":
+                print(json.dumps(summarize(connection, args.last, args.url), indent=2))
                 return 0
             if args.command == "add":
                 print(json.dumps(add_target(connection, args.name, args.url, args.timeout), indent=2))
