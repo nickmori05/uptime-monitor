@@ -162,6 +162,7 @@ After leaving the watcher running, use `summary` to see how each endpoint did:
 ```sh
 python3 monitor.py summary
 python3 monitor.py summary --url https://example.com --last 50
+python3 monitor.py summary --state down
 ```
 
 The default sample is the last 100 saved checks **per URL**. `--last` accepts
@@ -169,6 +170,11 @@ The default sample is the last 100 saved checks **per URL**. `--last` accepts
 the latest result, and average/minimum/maximum latency for successful checks.
 Timeouts and other failures count as down but aren't mixed into those latency
 figures. If every sampled check failed, the latency fields are `null`.
+
+`--state up` or `--state down` filters endpoints by their latest saved result.
+It keeps both successful and failed checks in each endpoint's sample. Use it
+with `--url` and `--last` as needed. No matches returns `[]`; this describes the
+last observation, not the endpoint's live state.
 
 URLs are matched exactly and returned alphabetically. Two target names pointing
 to the same URL share one summary. Removing a target keeps its saved results.

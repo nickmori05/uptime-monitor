@@ -90,6 +90,35 @@ class SummaryTests(unittest.TestCase):
                 monitor.summarize(self.connection, last=last)
         with self.assertRaises(ValueError):
             monitor.summarize(self.connection, url='file:///etc/hosts')
+        with self.assertRaisesRegex(ValueError, 'Summary state'):
+            monitor.summarize(self.connection, state='unknown')
+
+    def test_state_filter_uses_latest_result_without_removing_other_samples(self):
+        self.save(state='up')
+        self.save(state='down')
+        self.save(state='down', url='https://recovered.example')
+        self.save(state='up', url='https://recovered.example')
+        down, = monitor.summarize(self.connection, state='down')
+        self.assertEqual(down['url'], 'https://example.com')
+        self.assertEqual((down['up_checks'], down['down_checks'], down['sampled_checks']), (1, 1, 2))
+        up, = monitor.summarize(self.connection, state='up')
+        self.assertEqual(up['url'], 'https://recovered.example')
+        self.assertEqual(up['down_checks'], 1)
+
+    def test_cli_state_filter_combines_with_url_and_sample_size(self):
+        self.save(state='down')
+        self.save(state='up')
+        args = ['--database', str(self.database), 'summary', '--url', 'https://example.com', '--last', '1']
+        for state in ('up', 'down'):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(monitor.main(args + ['--state', state]), 0)
+            rows = json.loads(output.getvalue())
+            if state == 'up':
+                self.assertEqual(rows[0]['sampled_checks'], 1)
+                self.assertEqual(rows[0]['down_checks'], 0)
+            else:
+                self.assertEqual(rows, [])
 
     def test_cli_reads_saved_history_without_network_or_writes(self):
         self.save(state='down')
