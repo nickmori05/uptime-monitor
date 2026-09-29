@@ -295,7 +295,9 @@ def parser() -> argparse.ArgumentParser:
     listing.add_argument("--url", help="Only show checks for this exact URL")
     summary = commands.add_parser("summary", help="Summarize saved checks per endpoint without making requests")
     summary.add_argument("--last", type=int, default=100, help="Recent checks per URL, 1–10000 (default: 100)")
-    summary.add_argument("--url", help="Only summarize this exact URL")
+    summary_target = summary.add_mutually_exclusive_group()
+    summary_target.add_argument("--url", help="Only summarize this exact URL")
+    summary_target.add_argument("--target", help="Summarize the URL currently saved for this target name")
     summary.add_argument("--state", choices=("up", "down"), help="Only include endpoints whose latest saved check has this state")
     add = commands.add_parser("add", help="Save a named target without making a request")
     add.add_argument("name")
@@ -346,7 +348,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(history(connection, args.limit, args.url), indent=2))
                 return 0
             if args.command == "summary":
-                print(json.dumps(summarize(connection, args.last, args.url, state=args.state), indent=2))
+                url = get_target(connection, args.target)["url"] if args.target is not None else args.url
+                print(json.dumps(summarize(connection, args.last, url, state=args.state), indent=2))
                 return 0
             if args.command == "add":
                 print(json.dumps(add_target(connection, args.name, args.url, args.timeout), indent=2))

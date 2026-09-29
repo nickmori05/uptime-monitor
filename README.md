@@ -165,6 +165,11 @@ python3 monitor.py summary --url https://example.com --last 50
 python3 monitor.py summary --state down
 ```
 
+For a saved target, use `python3 monitor.py summary --target example`. It uses
+that name's current URL and can be combined with `--state` and `--last`.
+Choose either `--target` or `--url`; a missing target exits `2`. After changing
+a target's URL, use `--url` to inspect checks recorded for the old address.
+
 The default sample is the last 100 saved checks **per URL**. `--last` accepts
 1–10,000. Results include total stored checks, sampled checks, up/down counts,
 the latest result, and average/minimum/maximum latency for successful checks.

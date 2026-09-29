@@ -136,6 +136,32 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), '')
         self.assertIn('Summary sample size', errors.getvalue())
 
+    def test_cli_target_uses_current_saved_url_and_combines_with_filters(self):
+        monitor.add_target(self.connection, 'api', 'https://old.example')
+        self.save(url='https://old.example')
+        monitor.update_target(self.connection, 'api', url='https://new.example')
+        self.save(url='https://new.example')
+        self.save(state='down', url='https://new.example')
+        args = ['--database', str(self.database), 'summary', '--target', 'api', '--last', '1', '--state', 'down']
+        output = io.StringIO()
+        with patch('monitor.probe') as probe, redirect_stdout(output):
+            self.assertEqual(monitor.main(args), 0)
+        probe.assert_not_called()
+        row, = json.loads(output.getvalue())
+        self.assertEqual(row['url'], 'https://new.example')
+        self.assertEqual((row['sampled_checks'], row['down_checks']), (1, 1))
+
+    def test_cli_missing_target_reports_error_and_url_target_conflict_is_rejected(self):
+        args = ['--database', str(self.database), 'summary', '--target', 'missing']
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(monitor.main(args), 2)
+        self.assertEqual(output.getvalue(), '')
+        self.assertIn("Target 'missing' does not exist", errors.getvalue())
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            monitor.main(args + ['--url', 'https://example.com'])
+        self.assertEqual(error.exception.code, 2)
+
 
 if __name__ == '__main__':
     unittest.main()
