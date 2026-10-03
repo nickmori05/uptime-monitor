@@ -6,3 +6,11 @@ __pycache__/
 *.py[cod]
 .venv/
 .DS_Store
+
+# Local assistant and editor state
+.codex/
+.cursor/
+.claude/
+codex/
+cursor/
+claude/
