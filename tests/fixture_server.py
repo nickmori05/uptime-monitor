@@ -1,4 +1,5 @@
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
 
 
 class Endpoint(BaseHTTPRequestHandler):
@@ -6,6 +7,9 @@ class Endpoint(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
+            status = 200
+        elif self.path == "/slow":
+            time.sleep(3)
             status = 200
         elif self.path == "/service":
             Endpoint.checks += 1

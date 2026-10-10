@@ -3,7 +3,7 @@ services:
     build: .
     image: ${MONITOR_IMAGE:-uptime-monitor:local}
     init: true
-    command: ["watch", "--interval", "30"]
+    command: ["watch", "--interval", "30", "--deadline", "20"]
     volumes:
       - monitor-data:/data
     read_only: true

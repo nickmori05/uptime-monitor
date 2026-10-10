@@ -226,7 +226,8 @@ docker compose up -d monitor
 docker compose logs -f monitor
 ```
 
-The service checks saved targets every 30 seconds after each batch finishes.
+The service checks saved targets every 30 seconds after each batch finishes,
+giving each request at most 20 seconds with `--deadline 20`.
 It runs as a non-root user with a read-only filesystem, except for `/data` and
 `/tmp`. The named `monitor-data` volume stores the database. Container recreation
 and `docker compose down` preserve it. `docker compose down --volumes` deletes it.
@@ -247,9 +248,9 @@ remain and does not automatically restart; after adding new targets, run
 container, `localhost` refers to the container, so target URLs must be reachable
 from its network.
 
-Compose sends SIGTERM and allows 75 seconds before forcing shutdown. Committed
-checks remain in the volume, but an active request can still exceed this grace
-period because socket timeouts do not bound the whole operation.
+Compose sends SIGTERM and allows 75 seconds before forcing shutdown. The 20
+second deadline keeps active requests well inside that grace period, even when a
+DNS lookup hangs. Committed checks remain in the volume.
 
 Run the container integration check with Docker and Compose available:
 
@@ -260,7 +261,7 @@ python3 scripts/docker_smoke.py
 It builds an isolated image, uses a temporary Compose project and volume, and
 checks two failures followed by two recoveries against a fixture on an internal
 network. It also checks non-root execution, persistence across containers, and
-SIGTERM shutdown. Its temporary containers, network, volume, and image are
+SIGTERM shutdown, and that a slow response is cut off by `--deadline`. Its temporary containers, network, volume, and image are
 removed afterward; your regular monitor volume is not used.
 
 ## Storage

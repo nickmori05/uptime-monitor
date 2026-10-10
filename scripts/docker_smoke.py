@@ -69,6 +69,11 @@ def main():
         assert len(json.loads(command("history"))) == 5
         assert json.loads(command("incidents")) == [incident]
         print("SIGTERM shutdown and saved history passed.", flush=True)
+
+        # The fixture serves one request at a time, so this runs after the watcher checks.
+        slow = json.loads(command("check", "http://fixture:8000/slow", "--timeout", "10", "--deadline", "1", expected=1))
+        assert slow["error"] == "deadline_exceeded" and slow["latency_ms"] < 3000, slow
+        print("Request deadline passed.", flush=True)
     finally:
         run(["down", "--volumes", "--remove-orphans"])
         subprocess.run(["docker", "image", "rm", environment["MONITOR_IMAGE"]],

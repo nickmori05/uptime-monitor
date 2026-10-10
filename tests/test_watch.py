@@ -2,6 +2,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 import json
+import re
 from pathlib import Path
 import selectors
 import signal
@@ -113,6 +114,14 @@ class WatchTests(unittest.TestCase):
         with redirect_stderr(StringIO()), patch.object(monitor, "probe") as probe:
             self.assertEqual(monitor.main(["--database", str(self.database), "watch", "--deadline", "inf"]), 2)
             probe.assert_not_called()
+
+    def test_compose_watcher_deadline_fits_within_the_stop_grace_period(self):
+        compose = (Path(__file__).resolve().parents[1] / "compose.yml").read_text()
+        command = json.loads(re.search(r"command: (\[.*\])", compose).group(1))
+        grace = int(re.search(r"stop_grace_period: (\d+)s", compose).group(1))
+        deadline = float(command[command.index("--deadline") + 1])
+        self.assertEqual(monitor.validate_deadline(deadline), deadline)
+        self.assertLess(deadline, grace)
 
     def test_healthy_finite_watch_exits_successfully(self):
         with patch.object(monitor, "probe", return_value=self.result()), redirect_stdout(StringIO()):
