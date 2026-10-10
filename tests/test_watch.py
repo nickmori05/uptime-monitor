@@ -52,7 +52,7 @@ class WatchTests(unittest.TestCase):
                 patch.object(monitor, "sleep", side_effect=replace_target):
             batches = list(monitor.watch_targets(self.connection, count=2))
         self.assertEqual([b["results"][0]["target"] for b in batches], ["api", "new-api"])
-        self.assertEqual(probe.call_args.args, ("https://new.example", 2))
+        self.assertEqual(probe.call_args.args, ("https://new.example", 2, None))
 
     def test_watcher_picks_up_updated_settings_next_round(self):
         def update_settings(seconds):
@@ -66,7 +66,7 @@ class WatchTests(unittest.TestCase):
                 patch.object(monitor, "sleep", side_effect=update_settings):
             batches = list(monitor.watch_targets(self.connection, count=2))
         self.assertEqual([call.args for call in probe.call_args_list],
-                         [("https://example.com", 5), ("https://example.com", 2)])
+                         [("https://example.com", 5, None), ("https://example.com", 2, None)])
         self.assertEqual(len(batches), 2)
 
     def test_empty_target_list_exits_without_waiting(self):
@@ -101,6 +101,18 @@ class WatchTests(unittest.TestCase):
         batches = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual([b["results"][0]["state"] for b in batches], ["down", "up"])
         self.assertEqual(len(monitor.history(self.connection)), 2)
+
+    def test_deadline_applies_to_every_round(self):
+        output = StringIO()
+        with patch.object(monitor, "probe", return_value=self.result()) as probe, \
+                patch.object(monitor, "sleep"), redirect_stdout(output):
+            code = monitor.main(["--database", str(self.database), "watch", "--count", "2", "--deadline", "8"])
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args for call in probe.call_args_list],
+                         [("https://example.com", 5, 8), ("https://example.com", 5, 8)])
+        with redirect_stderr(StringIO()), patch.object(monitor, "probe") as probe:
+            self.assertEqual(monitor.main(["--database", str(self.database), "watch", "--deadline", "inf"]), 2)
+            probe.assert_not_called()
 
     def test_healthy_finite_watch_exits_successfully(self):
         with patch.object(monitor, "probe", return_value=self.result()), redirect_stdout(StringIO()):

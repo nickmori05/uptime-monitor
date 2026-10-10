@@ -64,7 +64,9 @@ python3 monitor.py history --url https://example.com --limit 5
 ```
 
 `add` saves configuration without sending a request. `run` makes one check,
-persists the result, and uses the same exit codes as `check`. Names are case
+persists the result, and uses the same exit codes as `check`. It also accepts
+`--deadline`, e.g. `python3 monitor.py run example --deadline 10`; the deadline
+applies to that run only and is not saved with the target. Names are case
 sensitive and contain 1–64 ASCII letters, digits, underscores, or hyphens;
 the first character must be a letter or digit. Duplicate names are rejected
 without changing the existing configuration. History filtering matches the
@@ -108,6 +110,11 @@ writes happen on the calling thread and each finished observation is committed
 separately. Output is a JSON array sorted by target name; each entry includes
 the target name and the saved observation ID.
 
+`run-all --deadline 10` applies the same whole-request limit to every target in
+the batch. A request that passes its deadline is saved as `deadline_exceeded`
+without holding up the others, and its worker slot is freed even if the
+abandoned lookup is still running.
+
 The command returns `0` if all targets are up or no targets exist, `1` if any
 target is down, and `2` for invalid configuration or storage errors. A down
 endpoint does not prevent the other results from being saved. Configuration is
@@ -115,14 +122,16 @@ validated before any batch requests start.
 
 On Ctrl+C, queued requests are cancelled and the command returns `130` after
 active requests finish. Already committed observations remain in history.
-The socket timeout is still not a whole-operation deadline, so an active DNS
-lookup or request may delay shutdown.
+Without `--deadline`, the socket timeout is not a whole-operation deadline, so
+an active DNS lookup or request may delay shutdown. With one, shutdown waits at
+most about that long for active requests.
 
 ## Keep watching
 
 ```sh
 python3 monitor.py watch --interval 30 --workers 4
 python3 monitor.py watch --interval 5 --count 4
+python3 monitor.py watch --interval 30 --deadline 15
 ```
 
 `watch` repeats batches in the foreground. It waits `--interval` seconds after
@@ -139,7 +148,8 @@ failure, even if later rounds recover; otherwise it exits `0`.
 
 Ctrl+C exits `130`; SIGTERM exits `143`. While waiting between rounds, shutdown
 is immediate. During a batch, queued requests are cancelled and shutdown waits
-for active requests. Already committed observations survive. The socket timeout
+for active requests. Already committed observations survive. `--deadline` works
+as it does for `run-all`, on every round; without it, the socket timeout
 limitations above also apply here. Storage or configuration errors stop the
 watcher with exit code `2`.
 
@@ -280,7 +290,7 @@ Target tests cover persisted settings, duplicate names, invalid configuration,
 configured timeouts, failed checks, URL-filtered history, and target removal
 without losing past checks.
 Batch tests verify overlapping requests, the worker limit, writes on the calling
-thread, mixed results, and CLI exit codes. Concurrency is checked with a barrier
+thread, mixed results, deadlines that don't hold up other targets, and CLI exit codes. Concurrency is checked with a barrier
 rather than by comparing wall-clock timings.
 
 Watch tests cover target reloads, wait placement, streamed output, saved results
@@ -293,7 +303,7 @@ GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration
 
 ## Structure
 
-- `probe`: make one request and classify the observation.
+- `probe`: make one request, optionally within a total deadline, and classify the observation.
 - `save` and `history`: persist and retrieve observations using SQLite.
 - `summarize`: group recent saved observations by URL for a quick health report.
 - `add_target`, `get_target`, `list_targets`, `update_target`, and `remove_target`: manage reusable check settings.
@@ -313,6 +323,6 @@ or hosted API, and does not calculate uptime percentages from sparse observation
 
 Next milestones:
 
-1. Add an explicit total-request deadline.
-2. Add an API and a small dashboard for viewing results.
-3. Add alert deduplication and measured reliability tests.
+1. Add an API and a small dashboard for viewing results.
+2. Add alert deduplication and measured reliability tests.
+3. Consider saving a default deadline with each target.

@@ -268,9 +268,11 @@ def remove_target(connection: sqlite3.Connection, name: str) -> dict:
     return {"removed": name}
 
 
-def run_targets(connection: sqlite3.Connection, workers: int = 4) -> list[dict]:
+def run_targets(connection: sqlite3.Connection, workers: int = 4,
+                deadline: float | None = None) -> list[dict]:
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("Workers must be between 1 and 32.")
+    deadline = validate_deadline(deadline)
     targets = list_targets(connection)
     for target in targets:
         validate_url(target["url"])
@@ -281,7 +283,7 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4) -> list[dict]:
     results = []
     try:
         pending = {
-            pool.submit(probe, target["url"], target["timeout"]): target["name"]
+            pool.submit(probe, target["url"], target["timeout"], deadline): target["name"]
             for target in targets
         }
         for future in as_completed(pending):
@@ -294,16 +296,17 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4) -> list[dict]:
 
 
 def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
-                  count: int | None = None, workers: int = 4):
+                  count: int | None = None, workers: int = 4, deadline: float | None = None):
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not math.isfinite(interval) or not 1 <= interval <= 86400:
         raise ValueError("Interval must be between 1 and 86400 seconds.")
     if count is not None and (type(count) is not int or count < 1):
         raise ValueError("Count must be a positive integer.")
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("Workers must be between 1 and 32.")
+    deadline = validate_deadline(deadline)
     cycle = 0
     while True:
-        results = run_targets(connection, workers)
+        results = run_targets(connection, workers, deadline)
         cycle += 1
         yield {"cycle": cycle, "results": results}
         if not results or (count is not None and cycle >= count):
@@ -349,12 +352,15 @@ def parser() -> argparse.ArgumentParser:
     remove.add_argument("name")
     run = commands.add_parser("run", help="Check one saved target and record the result")
     run.add_argument("name")
+    run.add_argument("--deadline", type=float, help="Give up on the whole request after this many seconds")
     batch = commands.add_parser("run-all", help="Check all saved targets with bounded concurrency")
     batch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
+    batch.add_argument("--deadline", type=float, help="Per-request limit in seconds for the whole check")
     watch = commands.add_parser("watch", help="Repeat batches until stopped or the count is reached")
     watch.add_argument("--workers", type=int, default=4)
     watch.add_argument("--interval", type=float, default=30.0, help="Seconds to wait after each batch")
     watch.add_argument("--count", type=int, help="Number of batches; omit to keep watching")
+    watch.add_argument("--deadline", type=float, help="Per-request limit in seconds for the whole check")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=validate_url, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"))
@@ -370,7 +376,8 @@ def main(argv: list[str] | None = None) -> int:
         with closing(connect(args.database)) as connection:
             if args.command == "watch":
                 failed = False
-                for batch in watch_targets(connection, interval=args.interval, count=args.count, workers=args.workers):
+                for batch in watch_targets(connection, interval=args.interval, count=args.count,
+                                           workers=args.workers, deadline=args.deadline):
                     failed = failed or any(row["state"] == "down" for row in batch["results"])
                     print(json.dumps(batch), flush=True)
                 return 1 if failed else 0
@@ -402,12 +409,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(remove_target(connection, args.name), indent=2))
                 return 0
             if args.command == "run-all":
-                results = run_targets(connection, args.workers)
+                results = run_targets(connection, args.workers, args.deadline)
                 print(json.dumps(results, indent=2))
                 return 1 if any(row["state"] == "down" for row in results) else 0
             if args.command == "run":
                 target = get_target(connection, args.name)
-                result = probe(target["url"], target["timeout"])
+                result = probe(target["url"], target["timeout"], args.deadline)
             else:
                 result = probe(args.url, args.timeout, args.deadline)
             identifier = save(connection, result)
