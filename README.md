@@ -37,6 +37,21 @@ python3 monitor.py check https://example.com --timeout 3
 It is not a guaranteed deadline for the whole operation: DNS resolution and
 multiple network steps may take additional time.
 
+To cap the whole check, add `--deadline`:
+
+```sh
+python3 monitor.py check https://example.com --timeout 3 --deadline 10
+```
+
+The deadline covers DNS resolution, connecting, and waiting for response
+headers. It accepts greater than 0 to at most 60 seconds. If it passes first,
+the check is saved as `down` with error `deadline_exceeded` and no status code,
+and the command exits `1`. A deadline shorter than the socket timeout simply
+takes over; a longer one only catches steps the socket timeout doesn't bound.
+The abandoned request keeps running in the background until its own socket
+timeout or DNS lookup finishes, but the result is not waited for or saved.
+Without `--deadline`, checks behave as before.
+
 ## Named targets
 
 Save an endpoint and its timeout once, then run checks by name:
@@ -49,7 +64,9 @@ python3 monitor.py history --url https://example.com --limit 5
 ```
 
 `add` saves configuration without sending a request. `run` makes one check,
-persists the result, and uses the same exit codes as `check`. Names are case
+persists the result, and uses the same exit codes as `check`. It also accepts
+`--deadline`, e.g. `python3 monitor.py run example --deadline 10`; the deadline
+applies to that run only and is not saved with the target. Names are case
 sensitive and contain 1–64 ASCII letters, digits, underscores, or hyphens;
 the first character must be a letter or digit. Duplicate names are rejected
 without changing the existing configuration. History filtering matches the
@@ -93,6 +110,11 @@ writes happen on the calling thread and each finished observation is committed
 separately. Output is a JSON array sorted by target name; each entry includes
 the target name and the saved observation ID.
 
+`run-all --deadline 10` applies the same whole-request limit to every target in
+the batch. A request that passes its deadline is saved as `deadline_exceeded`
+without holding up the others, and its worker slot is freed even if the
+abandoned lookup is still running.
+
 The command returns `0` if all targets are up or no targets exist, `1` if any
 target is down, and `2` for invalid configuration or storage errors. A down
 endpoint does not prevent the other results from being saved. Configuration is
@@ -100,14 +122,16 @@ validated before any batch requests start.
 
 On Ctrl+C, queued requests are cancelled and the command returns `130` after
 active requests finish. Already committed observations remain in history.
-The socket timeout is still not a whole-operation deadline, so an active DNS
-lookup or request may delay shutdown.
+Without `--deadline`, the socket timeout is not a whole-operation deadline, so
+an active DNS lookup or request may delay shutdown. With one, shutdown waits at
+most about that long for active requests.
 
 ## Keep watching
 
 ```sh
 python3 monitor.py watch --interval 30 --workers 4
 python3 monitor.py watch --interval 5 --count 4
+python3 monitor.py watch --interval 30 --deadline 15
 ```
 
 `watch` repeats batches in the foreground. It waits `--interval` seconds after
@@ -124,7 +148,8 @@ failure, even if later rounds recover; otherwise it exits `0`.
 
 Ctrl+C exits `130`; SIGTERM exits `143`. While waiting between rounds, shutdown
 is immediate. During a batch, queued requests are cancelled and shutdown waits
-for active requests. Already committed observations survive. The socket timeout
+for active requests. Already committed observations survive. `--deadline` works
+as it does for `run-all`, on every round; without it, the socket timeout
 limitations above also apply here. Storage or configuration errors stop the
 watcher with exit code `2`.
 
@@ -201,7 +226,8 @@ docker compose up -d monitor
 docker compose logs -f monitor
 ```
 
-The service checks saved targets every 30 seconds after each batch finishes.
+The service checks saved targets every 30 seconds after each batch finishes,
+giving each request at most 20 seconds with `--deadline 20`.
 It runs as a non-root user with a read-only filesystem, except for `/data` and
 `/tmp`. The named `monitor-data` volume stores the database. Container recreation
 and `docker compose down` preserve it. `docker compose down --volumes` deletes it.
@@ -222,9 +248,9 @@ remain and does not automatically restart; after adding new targets, run
 container, `localhost` refers to the container, so target URLs must be reachable
 from its network.
 
-Compose sends SIGTERM and allows 75 seconds before forcing shutdown. Committed
-checks remain in the volume, but an active request can still exceed this grace
-period because socket timeouts do not bound the whole operation.
+Compose sends SIGTERM and allows 75 seconds before forcing shutdown. The 20
+second deadline keeps active requests well inside that grace period, even when a
+DNS lookup hangs. Committed checks remain in the volume.
 
 Run the container integration check with Docker and Compose available:
 
@@ -235,7 +261,7 @@ python3 scripts/docker_smoke.py
 It builds an isolated image, uses a temporary Compose project and volume, and
 checks two failures followed by two recoveries against a fixture on an internal
 network. It also checks non-root execution, persistence across containers, and
-SIGTERM shutdown. Its temporary containers, network, volume, and image are
+SIGTERM shutdown, and that a slow response is cut off by `--deadline`. Its temporary containers, network, volume, and image are
 removed afterward; your regular monitor volume is not used.
 
 ## Storage
@@ -259,13 +285,13 @@ python3 -m unittest discover -s tests -v
 
 The test suite uses a temporary local HTTP server and temporary databases.
 It checks HTTP success, server failure, redirects, timeouts, persistence,
-history ordering, input validation, and command-line exit codes. Connection
-failure is injected so that it does not depend on external networking.
+history ordering, request deadlines, input validation, and command-line exit codes. Connection
+failures and hung lookups are injected so they don't depend on external networking.
 Target tests cover persisted settings, duplicate names, invalid configuration,
 configured timeouts, failed checks, URL-filtered history, and target removal
 without losing past checks.
 Batch tests verify overlapping requests, the worker limit, writes on the calling
-thread, mixed results, and CLI exit codes. Concurrency is checked with a barrier
+thread, mixed results, deadlines that don't hold up other targets, and CLI exit codes. Concurrency is checked with a barrier
 rather than by comparing wall-clock timings.
 
 Watch tests cover target reloads, wait placement, streamed output, saved results
@@ -278,7 +304,7 @@ GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration
 
 ## Structure
 
-- `probe`: make one request and classify the observation.
+- `probe`: make one request, optionally within a total deadline, and classify the observation.
 - `save` and `history`: persist and retrieve observations using SQLite.
 - `summarize`: group recent saved observations by URL for a quick health report.
 - `add_target`, `get_target`, `list_targets`, `update_target`, and `remove_target`: manage reusable check settings.
@@ -298,6 +324,6 @@ or hosted API, and does not calculate uptime percentages from sparse observation
 
 Next milestones:
 
-1. Add an explicit total-request deadline.
-2. Add an API and a small dashboard for viewing results.
-3. Add alert deduplication and measured reliability tests.
+1. Add an API and a small dashboard for viewing results.
+2. Add alert deduplication and measured reliability tests.
+3. Consider saving a default deadline with each target.

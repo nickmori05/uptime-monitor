@@ -81,7 +81,7 @@ class TargetTests(unittest.TestCase):
         result = monitor.Check("https://example.com/health", "2026-09-14T00:00:00+00:00", "up", 200, 1.0, None)
         with patch("monitor.probe", return_value=result) as probe, redirect_stdout(io.StringIO()):
             self.assertEqual(monitor.main(["--database", str(self.database), "run", "api"]), 0)
-        probe.assert_called_once_with("https://example.com/health", 2)
+        probe.assert_called_once_with("https://example.com/health", 2, None)
         self.assertEqual(monitor.history(self.connection)[0]["url"], result.url)
 
     def test_cli_remove_preserves_history_and_other_targets(self):
@@ -139,8 +139,20 @@ class TargetTests(unittest.TestCase):
         with patch("monitor.probe", return_value=result) as probe, redirect_stdout(io.StringIO()):
             code = monitor.main(["--database", str(self.database), "run", "api"])
         self.assertEqual(code, 1)
-        probe.assert_called_once_with("https://example.com/health", 2.5)
+        probe.assert_called_once_with("https://example.com/health", 2.5, None)
         self.assertEqual(monitor.history(self.connection)[0]["status_code"], 503)
+
+    def test_run_passes_its_deadline_to_the_saved_target_check(self):
+        monitor.add_target(self.connection, "api", "https://example.com/health", 2.5)
+        result = monitor.Check("https://example.com/health", "2026-10-10T00:00:00+00:00",
+                               "down", None, 3000.0, "deadline_exceeded")
+        output = io.StringIO()
+        with patch("monitor.probe", return_value=result) as probe, redirect_stdout(output):
+            code = monitor.main(["--database", str(self.database), "run", "api", "--deadline", "3"])
+        self.assertEqual(code, 1)
+        probe.assert_called_once_with("https://example.com/health", 2.5, 3)
+        self.assertEqual(json.loads(output.getvalue())["error"], "deadline_exceeded")
+        self.assertEqual(monitor.get_target(self.connection, "api")["timeout"], 2.5)
 
     def test_unknown_target_does_not_make_a_request(self):
         errors = io.StringIO()

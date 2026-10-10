@@ -22,7 +22,7 @@ class BatchTests(unittest.TestCase):
         for number in range(count):
             monitor.add_target(self.connection, f"target-{number}", f"https://example.com/{number}", number + 1)
 
-    def result(self, url, timeout):
+    def result(self, url, timeout, deadline=None):
         down = url.endswith("/1")
         return monitor.Check(url, "2026-09-10T00:00:00+00:00", "down" if down else "up",
                              503 if down else 200, 1.0, "http_503" if down else None)
@@ -34,7 +34,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual([row["target"] for row in results], [f"target-{number}" for number in range(4)])
         self.assertEqual([row["state"] for row in results], ["up", "down", "up", "up"])
         self.assertEqual({call.args for call in probe.call_args_list},
-                         {(f"https://example.com/{number}", number + 1) for number in range(4)})
+                         {(f"https://example.com/{number}", number + 1, None) for number in range(4)})
         reopened = monitor.connect(self.database)
         self.addCleanup(reopened.close)
         self.assertEqual(len(monitor.history(reopened)), 4)
@@ -47,7 +47,7 @@ class BatchTests(unittest.TestCase):
         active = 0
         peak = 0
 
-        def probe(url, timeout):
+        def probe(url, timeout, deadline):
             nonlocal active, peak
             with lock:
                 active += 1
@@ -123,6 +123,44 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("Workers must be between", errors.getvalue())
         probe.assert_not_called()
+
+    def test_deadline_is_passed_to_every_request_in_the_batch(self):
+        self.targets(3)
+        output = io.StringIO()
+        with patch("monitor.probe", side_effect=self.result) as probe, redirect_stdout(output):
+            code = monitor.main(["--database", str(self.database), "run-all", "--deadline", "4.5"])
+        self.assertEqual(code, 1)
+        self.assertEqual({call.args for call in probe.call_args_list},
+                         {(f"https://example.com/{number}", number + 1, 4.5) for number in range(3)})
+        self.assertEqual(len(json.loads(output.getvalue())), 3)
+
+    def test_deadline_failure_is_saved_without_holding_up_other_targets(self):
+        monitor.add_target(self.connection, "hung", "https://hung.example", 10)
+        monitor.add_target(self.connection, "ok", "https://ok.example", 10)
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def request_status(url, timeout):
+            if url == "https://hung.example":
+                release.wait(10)
+            return 200, None
+
+        with patch("monitor.request_status", side_effect=request_status):
+            results = monitor.run_targets(self.connection, workers=2, deadline=0.05)
+        self.assertEqual([(row["target"], row["state"], row["error"]) for row in results],
+                         [("hung", "down", "deadline_exceeded"), ("ok", "up", None)])
+        self.assertEqual(len(monitor.history(self.connection)), 2)
+
+    def test_invalid_deadline_never_sends_a_request(self):
+        self.targets(1)
+        with patch("monitor.probe") as probe:
+            for deadline in (0, -1, 61, True, float("nan")):
+                with self.subTest(deadline=deadline), self.assertRaises(ValueError):
+                    monitor.run_targets(self.connection, deadline=deadline)
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(monitor.main(["--database", str(self.database), "run-all", "--deadline", "0"]), 2)
+            probe.assert_not_called()
+        self.assertEqual(monitor.history(self.connection), [])
 
     def test_cli_cancellation_has_a_distinct_exit_code(self):
         errors = io.StringIO()

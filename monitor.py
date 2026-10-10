@@ -12,6 +12,7 @@ import re
 import sqlite3
 import signal
 import sys
+import threading
 from time import perf_counter, sleep
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -62,26 +63,61 @@ def validate_timeout(timeout: float) -> float:
     return timeout
 
 
-def probe(url: str, timeout: float = 5.0) -> Check:
-    url = validate_url(url)
-    timeout = validate_timeout(timeout)
-    started_at = datetime.now(timezone.utc).isoformat()
-    started = perf_counter()
-    status = None
-    error = None
+def validate_deadline(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    if isinstance(deadline, bool) or not math.isfinite(deadline) or not 0 < deadline <= 60:
+        raise ValueError("Deadline must be greater than 0 and at most 60 seconds.")
+    return deadline
+
+
+def request_status(url: str, timeout: float) -> tuple[int | None, str | None]:
     request = Request(url, headers={"User-Agent": "uptime-monitor/0.1"}, method="GET")
     try:
         with build_opener(NoRedirects()).open(request, timeout=timeout) as response:
-            status = response.status
+            return response.status, None
     except HTTPError as response:
-        status = response.code
         response.close()
+        return response.code, None
     except TimeoutError:
-        error = "timeout"
+        return None, "timeout"
     except URLError as failure:
-        error = "timeout" if isinstance(failure.reason, TimeoutError) else "connection_error"
+        return None, "timeout" if isinstance(failure.reason, TimeoutError) else "connection_error"
     except (OSError, http.client.HTTPException):
-        error = "connection_error"
+        return None, "connection_error"
+
+
+def request_within(url: str, timeout: float, deadline: float) -> tuple[int | None, str | None]:
+    # DNS lookups and slow servers can outlast the socket timeout, so the request
+    # runs on a daemon thread that is abandoned once the deadline passes.
+    outcome = []
+
+    def attempt():
+        try:
+            outcome.append(request_status(url, timeout))
+        except BaseException as error:
+            outcome.append(error)
+
+    worker = threading.Thread(target=attempt, name="probe-request", daemon=True)
+    worker.start()
+    worker.join(deadline)
+    if not outcome:
+        return None, "deadline_exceeded"
+    if isinstance(outcome[0], BaseException):
+        raise outcome[0]
+    return outcome[0]
+
+
+def probe(url: str, timeout: float = 5.0, deadline: float | None = None) -> Check:
+    url = validate_url(url)
+    timeout = validate_timeout(timeout)
+    deadline = validate_deadline(deadline)
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = perf_counter()
+    if deadline is None:
+        status, error = request_status(url, timeout)
+    else:
+        status, error = request_within(url, timeout, deadline)
     healthy = status is not None and 200 <= status < 300
     if not healthy and error is None:
         error = f"http_{status}"
@@ -232,9 +268,11 @@ def remove_target(connection: sqlite3.Connection, name: str) -> dict:
     return {"removed": name}
 
 
-def run_targets(connection: sqlite3.Connection, workers: int = 4) -> list[dict]:
+def run_targets(connection: sqlite3.Connection, workers: int = 4,
+                deadline: float | None = None) -> list[dict]:
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("Workers must be between 1 and 32.")
+    deadline = validate_deadline(deadline)
     targets = list_targets(connection)
     for target in targets:
         validate_url(target["url"])
@@ -245,7 +283,7 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4) -> list[dict]:
     results = []
     try:
         pending = {
-            pool.submit(probe, target["url"], target["timeout"]): target["name"]
+            pool.submit(probe, target["url"], target["timeout"], deadline): target["name"]
             for target in targets
         }
         for future in as_completed(pending):
@@ -258,16 +296,17 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4) -> list[dict]:
 
 
 def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
-                  count: int | None = None, workers: int = 4):
+                  count: int | None = None, workers: int = 4, deadline: float | None = None):
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not math.isfinite(interval) or not 1 <= interval <= 86400:
         raise ValueError("Interval must be between 1 and 86400 seconds.")
     if count is not None and (type(count) is not int or count < 1):
         raise ValueError("Count must be a positive integer.")
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("Workers must be between 1 and 32.")
+    deadline = validate_deadline(deadline)
     cycle = 0
     while True:
-        results = run_targets(connection, workers)
+        results = run_targets(connection, workers, deadline)
         cycle += 1
         yield {"cycle": cycle, "results": results}
         if not results or (count is not None and cycle >= count):
@@ -290,6 +329,7 @@ def parser() -> argparse.ArgumentParser:
     check = commands.add_parser("check", help="Check a URL once and save the result")
     check.add_argument("url")
     check.add_argument("--timeout", type=float, default=5.0, help="Socket timeout in seconds (default: 5)")
+    check.add_argument("--deadline", type=float, help="Give up on the whole request after this many seconds")
     listing = commands.add_parser("history", help="Show recent saved checks as JSON")
     listing.add_argument("--limit", type=int, default=20)
     listing.add_argument("--url", help="Only show checks for this exact URL")
@@ -312,12 +352,15 @@ def parser() -> argparse.ArgumentParser:
     remove.add_argument("name")
     run = commands.add_parser("run", help="Check one saved target and record the result")
     run.add_argument("name")
+    run.add_argument("--deadline", type=float, help="Give up on the whole request after this many seconds")
     batch = commands.add_parser("run-all", help="Check all saved targets with bounded concurrency")
     batch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
+    batch.add_argument("--deadline", type=float, help="Per-request limit in seconds for the whole check")
     watch = commands.add_parser("watch", help="Repeat batches until stopped or the count is reached")
     watch.add_argument("--workers", type=int, default=4)
     watch.add_argument("--interval", type=float, default=30.0, help="Seconds to wait after each batch")
     watch.add_argument("--count", type=int, help="Number of batches; omit to keep watching")
+    watch.add_argument("--deadline", type=float, help="Per-request limit in seconds for the whole check")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=validate_url, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"))
@@ -333,7 +376,8 @@ def main(argv: list[str] | None = None) -> int:
         with closing(connect(args.database)) as connection:
             if args.command == "watch":
                 failed = False
-                for batch in watch_targets(connection, interval=args.interval, count=args.count, workers=args.workers):
+                for batch in watch_targets(connection, interval=args.interval, count=args.count,
+                                           workers=args.workers, deadline=args.deadline):
                     failed = failed or any(row["state"] == "down" for row in batch["results"])
                     print(json.dumps(batch), flush=True)
                 return 1 if failed else 0
@@ -365,14 +409,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(remove_target(connection, args.name), indent=2))
                 return 0
             if args.command == "run-all":
-                results = run_targets(connection, args.workers)
+                results = run_targets(connection, args.workers, args.deadline)
                 print(json.dumps(results, indent=2))
                 return 1 if any(row["state"] == "down" for row in results) else 0
             if args.command == "run":
                 target = get_target(connection, args.name)
-                result = probe(target["url"], target["timeout"])
+                result = probe(target["url"], target["timeout"], args.deadline)
             else:
-                result = probe(args.url, args.timeout)
+                result = probe(args.url, args.timeout, args.deadline)
             identifier = save(connection, result)
             print(json.dumps({"id": identifier, **asdict(result)}, indent=2))
             return 0 if result.state == "up" else 1
