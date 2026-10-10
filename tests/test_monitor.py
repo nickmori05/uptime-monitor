@@ -137,11 +137,53 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(rows[0]["status_code"], 503)
         with redirect_stderr(io.StringIO()):
             self.assertEqual(monitor.main(args + ["check", "invalid"]), 2)
+
     def test_204_is_up(self):
         result = monitor.probe(self.base_url + "/empty")
         self.assertEqual(result.state, "up")
         self.assertEqual(result.status_code, 204)
 
+    def test_deadline_bounds_a_request_that_outlasts_its_socket_timeout(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with patch("monitor.build_opener") as factory:
+            factory.return_value.open.side_effect = lambda *_args, **_kwargs: release.wait(10)
+            result = monitor.probe("https://example.com", timeout=10, deadline=0.05)
+        self.assertEqual(result.state, "down")
+        self.assertIsNone(result.status_code)
+        self.assertEqual(result.error, "deadline_exceeded")
+        self.assertLess(result.latency_ms, 5000)
+
+    def test_requests_finishing_before_the_deadline_keep_their_result(self):
+        self.assertEqual(monitor.probe(self.base_url + "/ok", deadline=5).state, "up")
+        failed = monitor.probe(self.base_url + "/fail", deadline=5)
+        self.assertEqual((failed.status_code, failed.error), (503, "http_503"))
+        slow = monitor.probe(self.base_url + "/slow", timeout=0.03, deadline=5)
+        self.assertEqual(slow.error, "timeout")
+
+    def test_unexpected_errors_are_not_reported_as_deadline_failures(self):
+        with patch("monitor.request_status", side_effect=RuntimeError("bug")), \
+                self.assertRaisesRegex(RuntimeError, "bug"):
+            monitor.probe("https://example.com", deadline=5)
+
+    def test_invalid_deadlines_never_make_a_request(self):
+        with patch("monitor.build_opener") as factory:
+            for deadline in (0, -1, 61, True, float("nan"), float("inf")):
+                with self.subTest(deadline=deadline), self.assertRaises(ValueError):
+                    monitor.probe("https://example.com", deadline=deadline)
+            factory.assert_not_called()
+
+    def test_cli_check_records_deadline_failures(self):
+        args = ["--database", str(self.database), "check", self.base_url + "/slow"]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(monitor.main(args + ["--timeout", "5", "--deadline", "0.05"]), 1)
+        self.assertEqual(json.loads(output.getvalue())["error"], "deadline_exceeded")
+        connection = monitor.connect(self.database)
+        self.addCleanup(connection.close)
+        self.assertEqual(monitor.history(connection)[0]["error"], "deadline_exceeded")
+        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            self.assertEqual(monitor.main(args + ["--deadline", "0"]), 2)
 
 
 if __name__ == "__main__":

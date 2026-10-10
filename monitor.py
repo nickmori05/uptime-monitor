@@ -12,6 +12,7 @@ import re
 import sqlite3
 import signal
 import sys
+import threading
 from time import perf_counter, sleep
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -62,26 +63,61 @@ def validate_timeout(timeout: float) -> float:
     return timeout
 
 
-def probe(url: str, timeout: float = 5.0) -> Check:
-    url = validate_url(url)
-    timeout = validate_timeout(timeout)
-    started_at = datetime.now(timezone.utc).isoformat()
-    started = perf_counter()
-    status = None
-    error = None
+def validate_deadline(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    if isinstance(deadline, bool) or not math.isfinite(deadline) or not 0 < deadline <= 60:
+        raise ValueError("Deadline must be greater than 0 and at most 60 seconds.")
+    return deadline
+
+
+def request_status(url: str, timeout: float) -> tuple[int | None, str | None]:
     request = Request(url, headers={"User-Agent": "uptime-monitor/0.1"}, method="GET")
     try:
         with build_opener(NoRedirects()).open(request, timeout=timeout) as response:
-            status = response.status
+            return response.status, None
     except HTTPError as response:
-        status = response.code
         response.close()
+        return response.code, None
     except TimeoutError:
-        error = "timeout"
+        return None, "timeout"
     except URLError as failure:
-        error = "timeout" if isinstance(failure.reason, TimeoutError) else "connection_error"
+        return None, "timeout" if isinstance(failure.reason, TimeoutError) else "connection_error"
     except (OSError, http.client.HTTPException):
-        error = "connection_error"
+        return None, "connection_error"
+
+
+def request_within(url: str, timeout: float, deadline: float) -> tuple[int | None, str | None]:
+    # DNS lookups and slow servers can outlast the socket timeout, so the request
+    # runs on a daemon thread that is abandoned once the deadline passes.
+    outcome = []
+
+    def attempt():
+        try:
+            outcome.append(request_status(url, timeout))
+        except BaseException as error:
+            outcome.append(error)
+
+    worker = threading.Thread(target=attempt, name="probe-request", daemon=True)
+    worker.start()
+    worker.join(deadline)
+    if not outcome:
+        return None, "deadline_exceeded"
+    if isinstance(outcome[0], BaseException):
+        raise outcome[0]
+    return outcome[0]
+
+
+def probe(url: str, timeout: float = 5.0, deadline: float | None = None) -> Check:
+    url = validate_url(url)
+    timeout = validate_timeout(timeout)
+    deadline = validate_deadline(deadline)
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = perf_counter()
+    if deadline is None:
+        status, error = request_status(url, timeout)
+    else:
+        status, error = request_within(url, timeout, deadline)
     healthy = status is not None and 200 <= status < 300
     if not healthy and error is None:
         error = f"http_{status}"
@@ -290,6 +326,7 @@ def parser() -> argparse.ArgumentParser:
     check = commands.add_parser("check", help="Check a URL once and save the result")
     check.add_argument("url")
     check.add_argument("--timeout", type=float, default=5.0, help="Socket timeout in seconds (default: 5)")
+    check.add_argument("--deadline", type=float, help="Give up on the whole request after this many seconds")
     listing = commands.add_parser("history", help="Show recent saved checks as JSON")
     listing.add_argument("--limit", type=int, default=20)
     listing.add_argument("--url", help="Only show checks for this exact URL")
@@ -372,7 +409,7 @@ def main(argv: list[str] | None = None) -> int:
                 target = get_target(connection, args.name)
                 result = probe(target["url"], target["timeout"])
             else:
-                result = probe(args.url, args.timeout)
+                result = probe(args.url, args.timeout, args.deadline)
             identifier = save(connection, result)
             print(json.dumps({"id": identifier, **asdict(result)}, indent=2))
             return 0 if result.state == "up" else 1

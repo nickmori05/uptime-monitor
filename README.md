@@ -37,6 +37,21 @@ python3 monitor.py check https://example.com --timeout 3
 It is not a guaranteed deadline for the whole operation: DNS resolution and
 multiple network steps may take additional time.
 
+To cap the whole check, add `--deadline`:
+
+```sh
+python3 monitor.py check https://example.com --timeout 3 --deadline 10
+```
+
+The deadline covers DNS resolution, connecting, and waiting for response
+headers. It accepts greater than 0 to at most 60 seconds. If it passes first,
+the check is saved as `down` with error `deadline_exceeded` and no status code,
+and the command exits `1`. A deadline shorter than the socket timeout simply
+takes over; a longer one only catches steps the socket timeout doesn't bound.
+The abandoned request keeps running in the background until its own socket
+timeout or DNS lookup finishes, but the result is not waited for or saved.
+Without `--deadline`, checks behave as before.
+
 ## Named targets
 
 Save an endpoint and its timeout once, then run checks by name:
@@ -259,8 +274,8 @@ python3 -m unittest discover -s tests -v
 
 The test suite uses a temporary local HTTP server and temporary databases.
 It checks HTTP success, server failure, redirects, timeouts, persistence,
-history ordering, input validation, and command-line exit codes. Connection
-failure is injected so that it does not depend on external networking.
+history ordering, request deadlines, input validation, and command-line exit codes. Connection
+failures and hung lookups are injected so they don't depend on external networking.
 Target tests cover persisted settings, duplicate names, invalid configuration,
 configured timeouts, failed checks, URL-filtered history, and target removal
 without losing past checks.
