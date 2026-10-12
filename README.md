@@ -64,22 +64,39 @@ python3 monitor.py history --url https://example.com --limit 5
 ```
 
 `add` saves configuration without sending a request. `run` makes one check,
-persists the result, and uses the same exit codes as `check`. It also accepts
-`--deadline`, e.g. `python3 monitor.py run example --deadline 10`; the deadline
-applies to that run only and is not saved with the target. Names are case
+persists the result, and uses the same exit codes as `check`. Names are case
 sensitive and contain 1–64 ASCII letters, digits, underscores, or hyphens;
 the first character must be a letter or digit. Duplicate names are rejected
 without changing the existing configuration. History filtering matches the
 exact saved URL, including its path and query string.
+
+To bound every run of a target, save a default deadline with it:
+
+```sh
+python3 monitor.py add example https://example.com --timeout 3 --deadline 10
+python3 monitor.py run example
+python3 monitor.py run example --deadline 5
+```
+
+The saved deadline accepts the same range as `check --deadline` and is used by
+`run`, `run-all`, and `watch`. A `--deadline` given on the command line replaces
+it for that run only and is not saved; in `run-all` and `watch` it applies to
+every target, including those with their own deadline. Targets without a saved
+deadline keep the socket-timeout-only behavior. `targets` lists the saved
+`deadline`, or `null` when there is none. Databases created by earlier versions
+gain the empty column automatically the next time they are opened.
 
 Change an existing target without removing it:
 
 ```sh
 python3 monitor.py update example --timeout 2
 python3 monitor.py update example --url https://example.com/health --timeout 3
+python3 monitor.py update example --deadline 8
+python3 monitor.py update example --no-deadline
 ```
 
-Supply `--url`, `--timeout`, or both. Omitted settings stay unchanged. Updates
+Supply any of `--url`, `--timeout`, and `--deadline`, or `--no-deadline` to
+clear a saved deadline. Omitted settings stay unchanged. Updates
 print the saved settings as JSON without making a request. Invalid values or
 missing names return exit code `2` and leave the configuration unchanged.
 Past checks and incidents remain tied to their original URL. A running watcher
@@ -110,8 +127,8 @@ writes happen on the calling thread and each finished observation is committed
 separately. Output is a JSON array sorted by target name; each entry includes
 the target name and the saved observation ID.
 
-`run-all --deadline 10` applies the same whole-request limit to every target in
-the batch. A request that passes its deadline is saved as `deadline_exceeded`
+Targets with a saved deadline use it. `run-all --deadline 10` instead applies
+the same whole-request limit to every target in the batch. A request that passes its deadline is saved as `deadline_exceeded`
 without holding up the others, and its worker slot is freed even if the
 abandoned lookup is still running.
 
@@ -124,7 +141,8 @@ On Ctrl+C, queued requests are cancelled and the command returns `130` after
 active requests finish. Already committed observations remain in history.
 Without `--deadline`, the socket timeout is not a whole-operation deadline, so
 an active DNS lookup or request may delay shutdown. With one, shutdown waits at
-most about that long for active requests.
+most about that long for active requests. Saved per-target deadlines bound
+their own requests the same way.
 
 ## Keep watching
 
@@ -140,16 +158,16 @@ watcher. The interval must be 1–86,400 seconds. Omit `--count` to keep running
 or set a positive number of batches. An empty target list produces one empty
 batch and exits. Run one watcher per database to avoid duplicate checks.
 
-Each round reloads the saved targets, so another terminal can add or remove them
-without restarting the watcher. Each completed batch is flushed as one JSON line
+Each round reloads the saved targets, so another terminal can add, remove, or
+update them, including their saved deadlines, without restarting the watcher. Each completed batch is flushed as one JSON line
 with `cycle` and `results` fields. Observations are saved as requests finish,
 before the batch output appears. A finite run exits `1` if any round observed a
 failure, even if later rounds recover; otherwise it exits `0`.
 
 Ctrl+C exits `130`; SIGTERM exits `143`. While waiting between rounds, shutdown
 is immediate. During a batch, queued requests are cancelled and shutdown waits
-for active requests. Already committed observations survive. `--deadline` works
-as it does for `run-all`, on every round; without it, the socket timeout
+for active requests. Already committed observations survive. `--deadline` and saved
+target deadlines work as they do for `run-all`, on every round; without it, the socket timeout
 limitations above also apply here. Storage or configuration errors stop the
 watcher with exit code `2`.
 
@@ -227,7 +245,9 @@ docker compose logs -f monitor
 ```
 
 The service checks saved targets every 30 seconds after each batch finishes,
-giving each request at most 20 seconds with `--deadline 20`.
+giving each request at most 20 seconds with `--deadline 20`. That flag
+overrides any deadline saved with a target, so the stop grace period below
+always holds.
 It runs as a non-root user with a read-only filesystem, except for `/data` and
 `/tmp`. The named `monitor-data` volume stores the database. Container recreation
 and `docker compose down` preserve it. `docker compose down --volumes` deletes it.
@@ -289,7 +309,9 @@ history ordering, request deadlines, input validation, and command-line exit cod
 failures and hung lookups are injected so they don't depend on external networking.
 Target tests cover persisted settings, duplicate names, invalid configuration,
 configured timeouts, failed checks, URL-filtered history, and target removal
-without losing past checks.
+without losing past checks. Saved-deadline tests cover persistence, setting and
+clearing deadlines, rejected values, upgrading older databases, and how saved
+and command-line deadlines combine in `run`, `run-all`, and the watcher.
 Batch tests verify overlapping requests, the worker limit, writes on the calling
 thread, mixed results, deadlines that don't hold up other targets, and CLI exit codes. Concurrency is checked with a barrier
 rather than by comparing wall-clock timings.
@@ -326,4 +348,5 @@ Next milestones:
 
 1. Add an API and a small dashboard for viewing results.
 2. Add alert deduplication and measured reliability tests.
-3. Consider saving a default deadline with each target.
+3. ~~Consider saving a default deadline with each target.~~ Done: `add` and
+   `update` accept `--deadline`, and runs use it unless overridden.
