@@ -150,9 +150,15 @@ def connect(database: Path) -> sqlite3.Connection:
         """CREATE TABLE IF NOT EXISTS targets (
             name TEXT PRIMARY KEY,
             url TEXT NOT NULL,
-            timeout REAL NOT NULL CHECK(timeout > 0 AND timeout <= 60)
+            timeout REAL NOT NULL CHECK(timeout > 0 AND timeout <= 60),
+            deadline REAL CHECK(deadline IS NULL OR (deadline > 0 AND deadline <= 60))
         )"""
     )
+    # Databases created before targets had a saved deadline gain the column empty.
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(targets)")}
+    if "deadline" not in columns:
+        connection.execute("ALTER TABLE targets ADD COLUMN deadline REAL "
+                           "CHECK(deadline IS NULL OR (deadline > 0 AND deadline <= 60))")
     connection.execute("CREATE INDEX IF NOT EXISTS checks_url_id ON checks(url, id)")
     connection.commit()
     return connection
@@ -216,18 +222,20 @@ def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None =
     return [dict(row) for row in rows if state is None or row["latest_state"] == state]
 
 
-def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: float = 5.0) -> dict:
+def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: float = 5.0,
+               deadline: float | None = None) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
         raise ValueError("Name must be 1–64 letters, digits, hyphens, or underscores, starting with a letter or digit.")
     url = validate_url(url)
     timeout = validate_timeout(timeout)
+    deadline = validate_deadline(deadline)
     try:
         with connection:
-            connection.execute("INSERT INTO targets (name, url, timeout) VALUES (?, ?, ?)",
-                               (name, url, timeout))
+            connection.execute("INSERT INTO targets (name, url, timeout, deadline) VALUES (?, ?, ?, ?)",
+                               (name, url, timeout, deadline))
     except sqlite3.IntegrityError as error:
         raise ValueError(f"A target named '{name}' already exists.") from error
-    return {"name": name, "url": url, "timeout": timeout}
+    return {"name": name, "url": url, "timeout": timeout, "deadline": deadline}
 
 
 def get_target(connection: sqlite3.Connection, name: str) -> dict:
@@ -242,17 +250,22 @@ def list_targets(connection: sqlite3.Connection) -> list[dict]:
 
 
 def update_target(connection: sqlite3.Connection, name: str, *,
-                  url: str | None = None, timeout: float | None = None) -> dict:
-    if url is None and timeout is None:
-        raise ValueError("Provide a URL or timeout to update.")
+                  url: str | None = None, timeout: float | None = None,
+                  deadline: float | None = None, clear_deadline: bool = False) -> dict:
+    if deadline is not None and clear_deadline:
+        raise ValueError("Choose either a new deadline or clearing it, not both.")
+    if url is None and timeout is None and deadline is None and not clear_deadline:
+        raise ValueError("Provide a URL, timeout, or deadline to update.")
     if url is not None:
         url = validate_url(url)
     if timeout is not None:
         timeout = validate_timeout(timeout)
+    deadline = validate_deadline(deadline)
     with connection:
         cursor = connection.execute(
-            "UPDATE targets SET url = COALESCE(?, url), timeout = COALESCE(?, timeout) WHERE name = ?",
-            (url, timeout, name),
+            """UPDATE targets SET url = COALESCE(?, url), timeout = COALESCE(?, timeout),
+               deadline = CASE WHEN ? THEN NULL ELSE COALESCE(?, deadline) END WHERE name = ?""",
+            (url, timeout, clear_deadline, deadline, name),
         )
         if cursor.rowcount == 0:
             raise ValueError(f"Target '{name}' does not exist.")
@@ -268,6 +281,11 @@ def remove_target(connection: sqlite3.Connection, name: str) -> dict:
     return {"removed": name}
 
 
+def target_deadline(target: dict, override: float | None = None) -> float | None:
+    # A deadline given for one run replaces the target's saved default.
+    return override if override is not None else target["deadline"]
+
+
 def run_targets(connection: sqlite3.Connection, workers: int = 4,
                 deadline: float | None = None) -> list[dict]:
     if type(workers) is not int or not 1 <= workers <= 32:
@@ -277,13 +295,14 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4,
     for target in targets:
         validate_url(target["url"])
         validate_timeout(target["timeout"])
+        validate_deadline(target["deadline"])
     if not targets:
         return []
     pool = ThreadPoolExecutor(max_workers=workers)
     results = []
     try:
         pending = {
-            pool.submit(probe, target["url"], target["timeout"], deadline): target["name"]
+            pool.submit(probe, target["url"], target["timeout"], target_deadline(target, deadline)): target["name"]
             for target in targets
         }
         for future in as_completed(pending):
@@ -343,24 +362,28 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("name")
     add.add_argument("url")
     add.add_argument("--timeout", type=float, default=5.0)
-    update = commands.add_parser("update", help="Change a saved target's URL or timeout")
+    add.add_argument("--deadline", type=float, help="Default whole-request limit for this target's runs")
+    update = commands.add_parser("update", help="Change a saved target's URL, timeout, or deadline")
     update.add_argument("name")
     update.add_argument("--url")
     update.add_argument("--timeout", type=float)
+    update_deadline = update.add_mutually_exclusive_group()
+    update_deadline.add_argument("--deadline", type=float, help="Save a new default deadline")
+    update_deadline.add_argument("--no-deadline", action="store_true", help="Clear the saved deadline")
     commands.add_parser("targets", help="List saved targets")
     remove = commands.add_parser("remove", help="Remove a saved target without deleting its history")
     remove.add_argument("name")
     run = commands.add_parser("run", help="Check one saved target and record the result")
     run.add_argument("name")
-    run.add_argument("--deadline", type=float, help="Give up on the whole request after this many seconds")
+    run.add_argument("--deadline", type=float, help="Override the target's saved deadline for this run")
     batch = commands.add_parser("run-all", help="Check all saved targets with bounded concurrency")
     batch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
-    batch.add_argument("--deadline", type=float, help="Per-request limit in seconds for the whole check")
+    batch.add_argument("--deadline", type=float, help="Per-request limit for every target, overriding saved deadlines")
     watch = commands.add_parser("watch", help="Repeat batches until stopped or the count is reached")
     watch.add_argument("--workers", type=int, default=4)
     watch.add_argument("--interval", type=float, default=30.0, help="Seconds to wait after each batch")
     watch.add_argument("--count", type=int, help="Number of batches; omit to keep watching")
-    watch.add_argument("--deadline", type=float, help="Per-request limit in seconds for the whole check")
+    watch.add_argument("--deadline", type=float, help="Per-request limit for every target, overriding saved deadlines")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=validate_url, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"))
@@ -396,13 +419,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(summarize(connection, args.last, url, state=args.state), indent=2))
                 return 0
             if args.command == "add":
-                print(json.dumps(add_target(connection, args.name, args.url, args.timeout), indent=2))
+                print(json.dumps(add_target(connection, args.name, args.url, args.timeout, args.deadline), indent=2))
                 return 0
             if args.command == "targets":
                 print(json.dumps(list_targets(connection), indent=2))
                 return 0
             if args.command == "update":
-                target = update_target(connection, args.name, url=args.url, timeout=args.timeout)
+                target = update_target(connection, args.name, url=args.url, timeout=args.timeout,
+                                       deadline=args.deadline, clear_deadline=args.no_deadline)
                 print(json.dumps(target, indent=2))
                 return 0
             if args.command == "remove":
@@ -414,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1 if any(row["state"] == "down" for row in results) else 0
             if args.command == "run":
                 target = get_target(connection, args.name)
-                result = probe(target["url"], target["timeout"], args.deadline)
+                result = probe(target["url"], target["timeout"], target_deadline(target, args.deadline))
             else:
                 result = probe(args.url, args.timeout, args.deadline)
             identifier = save(connection, result)
