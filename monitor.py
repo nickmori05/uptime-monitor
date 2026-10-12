@@ -281,6 +281,11 @@ def remove_target(connection: sqlite3.Connection, name: str) -> dict:
     return {"removed": name}
 
 
+def target_deadline(target: dict, override: float | None = None) -> float | None:
+    # A deadline given for one run replaces the target's saved default.
+    return override if override is not None else target["deadline"]
+
+
 def run_targets(connection: sqlite3.Connection, workers: int = 4,
                 deadline: float | None = None) -> list[dict]:
     if type(workers) is not int or not 1 <= workers <= 32:
@@ -290,13 +295,14 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4,
     for target in targets:
         validate_url(target["url"])
         validate_timeout(target["timeout"])
+        validate_deadline(target["deadline"])
     if not targets:
         return []
     pool = ThreadPoolExecutor(max_workers=workers)
     results = []
     try:
         pending = {
-            pool.submit(probe, target["url"], target["timeout"], deadline): target["name"]
+            pool.submit(probe, target["url"], target["timeout"], target_deadline(target, deadline)): target["name"]
             for target in targets
         }
         for future in as_completed(pending):
@@ -369,15 +375,15 @@ def parser() -> argparse.ArgumentParser:
     remove.add_argument("name")
     run = commands.add_parser("run", help="Check one saved target and record the result")
     run.add_argument("name")
-    run.add_argument("--deadline", type=float, help="Give up on the whole request after this many seconds")
+    run.add_argument("--deadline", type=float, help="Override the target's saved deadline for this run")
     batch = commands.add_parser("run-all", help="Check all saved targets with bounded concurrency")
     batch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
-    batch.add_argument("--deadline", type=float, help="Per-request limit in seconds for the whole check")
+    batch.add_argument("--deadline", type=float, help="Per-request limit for every target, overriding saved deadlines")
     watch = commands.add_parser("watch", help="Repeat batches until stopped or the count is reached")
     watch.add_argument("--workers", type=int, default=4)
     watch.add_argument("--interval", type=float, default=30.0, help="Seconds to wait after each batch")
     watch.add_argument("--count", type=int, help="Number of batches; omit to keep watching")
-    watch.add_argument("--deadline", type=float, help="Per-request limit in seconds for the whole check")
+    watch.add_argument("--deadline", type=float, help="Per-request limit for every target, overriding saved deadlines")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=validate_url, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"))
@@ -432,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1 if any(row["state"] == "down" for row in results) else 0
             if args.command == "run":
                 target = get_target(connection, args.name)
-                result = probe(target["url"], target["timeout"], args.deadline)
+                result = probe(target["url"], target["timeout"], target_deadline(target, args.deadline))
             else:
                 result = probe(args.url, args.timeout, args.deadline)
             identifier = save(connection, result)
