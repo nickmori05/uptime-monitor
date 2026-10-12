@@ -150,9 +150,15 @@ def connect(database: Path) -> sqlite3.Connection:
         """CREATE TABLE IF NOT EXISTS targets (
             name TEXT PRIMARY KEY,
             url TEXT NOT NULL,
-            timeout REAL NOT NULL CHECK(timeout > 0 AND timeout <= 60)
+            timeout REAL NOT NULL CHECK(timeout > 0 AND timeout <= 60),
+            deadline REAL CHECK(deadline IS NULL OR (deadline > 0 AND deadline <= 60))
         )"""
     )
+    # Databases created before targets had a saved deadline gain the column empty.
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(targets)")}
+    if "deadline" not in columns:
+        connection.execute("ALTER TABLE targets ADD COLUMN deadline REAL "
+                           "CHECK(deadline IS NULL OR (deadline > 0 AND deadline <= 60))")
     connection.execute("CREATE INDEX IF NOT EXISTS checks_url_id ON checks(url, id)")
     connection.commit()
     return connection
@@ -216,18 +222,20 @@ def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None =
     return [dict(row) for row in rows if state is None or row["latest_state"] == state]
 
 
-def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: float = 5.0) -> dict:
+def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: float = 5.0,
+               deadline: float | None = None) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
         raise ValueError("Name must be 1–64 letters, digits, hyphens, or underscores, starting with a letter or digit.")
     url = validate_url(url)
     timeout = validate_timeout(timeout)
+    deadline = validate_deadline(deadline)
     try:
         with connection:
-            connection.execute("INSERT INTO targets (name, url, timeout) VALUES (?, ?, ?)",
-                               (name, url, timeout))
+            connection.execute("INSERT INTO targets (name, url, timeout, deadline) VALUES (?, ?, ?, ?)",
+                               (name, url, timeout, deadline))
     except sqlite3.IntegrityError as error:
         raise ValueError(f"A target named '{name}' already exists.") from error
-    return {"name": name, "url": url, "timeout": timeout}
+    return {"name": name, "url": url, "timeout": timeout, "deadline": deadline}
 
 
 def get_target(connection: sqlite3.Connection, name: str) -> dict:
@@ -242,17 +250,22 @@ def list_targets(connection: sqlite3.Connection) -> list[dict]:
 
 
 def update_target(connection: sqlite3.Connection, name: str, *,
-                  url: str | None = None, timeout: float | None = None) -> dict:
-    if url is None and timeout is None:
-        raise ValueError("Provide a URL or timeout to update.")
+                  url: str | None = None, timeout: float | None = None,
+                  deadline: float | None = None, clear_deadline: bool = False) -> dict:
+    if deadline is not None and clear_deadline:
+        raise ValueError("Choose either a new deadline or clearing it, not both.")
+    if url is None and timeout is None and deadline is None and not clear_deadline:
+        raise ValueError("Provide a URL, timeout, or deadline to update.")
     if url is not None:
         url = validate_url(url)
     if timeout is not None:
         timeout = validate_timeout(timeout)
+    deadline = validate_deadline(deadline)
     with connection:
         cursor = connection.execute(
-            "UPDATE targets SET url = COALESCE(?, url), timeout = COALESCE(?, timeout) WHERE name = ?",
-            (url, timeout, name),
+            """UPDATE targets SET url = COALESCE(?, url), timeout = COALESCE(?, timeout),
+               deadline = CASE WHEN ? THEN NULL ELSE COALESCE(?, deadline) END WHERE name = ?""",
+            (url, timeout, clear_deadline, deadline, name),
         )
         if cursor.rowcount == 0:
             raise ValueError(f"Target '{name}' does not exist.")
@@ -343,10 +356,14 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("name")
     add.add_argument("url")
     add.add_argument("--timeout", type=float, default=5.0)
-    update = commands.add_parser("update", help="Change a saved target's URL or timeout")
+    add.add_argument("--deadline", type=float, help="Default whole-request limit for this target's runs")
+    update = commands.add_parser("update", help="Change a saved target's URL, timeout, or deadline")
     update.add_argument("name")
     update.add_argument("--url")
     update.add_argument("--timeout", type=float)
+    update_deadline = update.add_mutually_exclusive_group()
+    update_deadline.add_argument("--deadline", type=float, help="Save a new default deadline")
+    update_deadline.add_argument("--no-deadline", action="store_true", help="Clear the saved deadline")
     commands.add_parser("targets", help="List saved targets")
     remove = commands.add_parser("remove", help="Remove a saved target without deleting its history")
     remove.add_argument("name")
@@ -396,13 +413,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(summarize(connection, args.last, url, state=args.state), indent=2))
                 return 0
             if args.command == "add":
-                print(json.dumps(add_target(connection, args.name, args.url, args.timeout), indent=2))
+                print(json.dumps(add_target(connection, args.name, args.url, args.timeout, args.deadline), indent=2))
                 return 0
             if args.command == "targets":
                 print(json.dumps(list_targets(connection), indent=2))
                 return 0
             if args.command == "update":
-                target = update_target(connection, args.name, url=args.url, timeout=args.timeout)
+                target = update_target(connection, args.name, url=args.url, timeout=args.timeout,
+                                       deadline=args.deadline, clear_deadline=args.no_deadline)
                 print(json.dumps(target, indent=2))
                 return 0
             if args.command == "remove":
