@@ -74,7 +74,26 @@ def main():
         slow = json.loads(command("check", "http://fixture:8000/slow", "--timeout", "10", "--deadline", "1", expected=1))
         assert slow["error"] == "deadline_exceeded" and slow["latency_ms"] < 3000, slow
         print("Request deadline passed.", flush=True)
+
+        run(["run", "--detach", "--no-deps", "--name", f"{project}-api", "monitor",
+             "serve", "--host", "0.0.0.0", "--port", "8080"])
+        fetch = ("import json, sys, time, urllib.request, urllib.error\n"
+                 "for attempt in range(50):\n"
+                 "    try:\n"
+                 "        response = urllib.request.urlopen(sys.argv[1], timeout=2)\n"
+                 "        break\n"
+                 "    except urllib.error.URLError:\n"
+                 "        time.sleep(0.2)\n"
+                 "print(response.read().decode())")
+        api = f"http://{project}-api:8080/api"
+        served, = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/summary?target=service"]))
+        assert (served["stored_checks"], served["latest_state"]) == (5, "up"), served
+        assert json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/incidents"])) == [incident]
+        assert len(json.loads(command("history", "--limit", "100"))) == 6
+        print("Read-only API passed.", flush=True)
     finally:
+        subprocess.run(["docker", "rm", "--force", f"{project}-api"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
         run(["down", "--volumes", "--remove-orphans"])
         subprocess.run(["docker", "image", "rm", environment["MONITOR_IMAGE"]],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
