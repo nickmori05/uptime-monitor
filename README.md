@@ -235,6 +235,41 @@ healthy now. There may be long gaps between checks. A large stored history can
 take time to summarize; the sample limit bounds the report's input per endpoint,
 but the query still examines matching history to rank and count it.
 
+## Read-only API
+
+Serve saved targets and results as JSON over HTTP:
+
+```sh
+python3 monitor.py serve
+curl http://127.0.0.1:8080/api/summary
+curl 'http://127.0.0.1:8080/api/history?limit=5&url=https%3A%2F%2Fexample.com'
+```
+
+`serve` listens on `127.0.0.1:8080` by default; change it with `--host` and
+`--port` (`--port 0` picks a free port). The address is printed to stderr.
+Four GET endpoints mirror the commands and accept the same filters as query
+parameters:
+
+- `/api/targets`: saved targets, like `targets`.
+- `/api/history`: `limit` and `url`, like `history`.
+- `/api/summary`: `url` or `target`, `last`, and `state`, like `summary`.
+- `/api/incidents`: `url`, `state`, `limit`, `failures`, and `recoveries`, like `incidents`.
+
+Responses use the same JSON as the commands. Invalid, unknown, or repeated
+parameters return `400` with an `{"error": ...}` body, unknown paths return `404`,
+and other methods return `405`. If the database can't be read, the response is
+`500` and the details go to stderr. URL values must be percent-encoded; an
+unencoded `+` or `&` in a filter URL changes its meaning.
+
+The API never makes requests or changes data. Each request opens the database
+read-only, so it can run beside a watcher on the same file. On startup, `serve`
+creates or upgrades the database once, like other commands. Ctrl+C exits `130`
+and SIGTERM exits `143`; a port that's already in use exits `2`.
+
+There is no authentication or TLS. Keep the default loopback address unless the
+network is trusted: anyone who can reach the port can read every saved URL and
+result. The Compose file does not publish a port for it.
+
 ## Docker
 
 ```sh
@@ -281,7 +316,8 @@ python3 scripts/docker_smoke.py
 It builds an isolated image, uses a temporary Compose project and volume, and
 checks two failures followed by two recoveries against a fixture on an internal
 network. It also checks non-root execution, persistence across containers, and
-SIGTERM shutdown, and that a slow response is cut off by `--deadline`. Its temporary containers, network, volume, and image are
+SIGTERM shutdown, that a slow response is cut off by `--deadline`, and that the
+API serves the watcher's history from another container. Its temporary containers, network, volume, and image are
 removed afterward; your regular monitor volume is not used.
 
 ## Storage
@@ -321,6 +357,9 @@ after interruption, and real process shutdown using SIGINT and SIGTERM. Incident
 tests cover independent streaks, recovery, filtering, persistence, and clock changes.
 Summary tests cover per-URL samples, successful-response latency, empty results,
 exact URL matching, clock changes, and reading history without making requests.
+API tests compare every endpoint with its command, cover filters, invalid and
+unknown parameters, unknown paths and write methods, storage errors, read-only
+database access, port errors, upgrading an older database, and signal shutdown.
 
 GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration check.
 
@@ -333,6 +372,7 @@ GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration
 - `run_targets`: run requests concurrently and save completed checks on the caller's connection.
 - `watch_targets`: repeat batches with a delay and fresh settings each round.
 - `list_incidents`: derive failure and recovery episodes from saved observations.
+- `serve` and `api.make_server`: answer read-only JSON requests from saved data.
 - `main`: parse commands, print JSON, and return exit codes.
 
 SQLite keeps the initial local workflow reproducible. A future shared service
@@ -341,12 +381,14 @@ would require an explicit concurrency, access, and network-boundary design.
 ## Development direction
 
 The current release runs individual checks, batches, and a foreground watcher,
-and derives incident reports from their history. It has no alerts, dashboard,
-or hosted API, and does not calculate uptime percentages from sparse observations.
+derives incident reports from their history, and serves them through a local
+read-only API. It has no alerts, dashboard, or authenticated hosted API, and does
+not calculate uptime percentages from sparse observations.
 
 Next milestones:
 
-1. Add an API and a small dashboard for viewing results.
+1. Add an API and a small dashboard for viewing results. The read-only JSON API
+   is done (`serve`); the dashboard remains.
 2. Add alert deduplication and measured reliability tests.
 3. ~~Consider saving a default deadline with each target.~~ Done: `add` and
    `update` accept `--deadline`, and runs use it unless overridden.
