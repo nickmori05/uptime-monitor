@@ -1,3 +1,4 @@
+import api
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
@@ -390,12 +391,28 @@ def parser() -> argparse.ArgumentParser:
     incidents.add_argument("--limit", type=int, default=20)
     incidents.add_argument("--failures", type=int, default=2, help="Consecutive failures to open an incident")
     incidents.add_argument("--recoveries", type=int, default=2, help="Consecutive successes to resolve it")
+    serve = commands.add_parser("serve", help="Serve saved results as a read-only JSON API")
+    serve.add_argument("--host", default="127.0.0.1", help="Address to listen on (default: 127.0.0.1)")
+    serve.add_argument("--port", type=int, default=8080, help="Port to listen on, 0 for any free port (default: 8080)")
     return root
+
+
+def serve(database: Path, host: str, port: int) -> None:
+    if type(port) is not int or not 0 <= port <= 65535:
+        raise ValueError("Port must be between 0 and 65535.")
+    # Create or upgrade the database once so every request can open it read-only.
+    connect(database).close()
+    with api.make_server(database, host, port, sys.modules[__name__]) as server:
+        print(f"Serving read-only API on http://{host}:{server.server_port}", file=sys.stderr, flush=True)
+        server.serve_forever()
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command == "serve":
+            serve(args.database, args.host, args.port)
+            return 0
         with closing(connect(args.database)) as connection:
             if args.command == "watch":
                 failed = False
