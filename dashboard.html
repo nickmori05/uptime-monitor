@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Uptime Monitor</title>
+<style>
+:root { color-scheme: light dark; --muted: #6b7280; --line: #d1d5db; --up: #15803d; --down: #b91c1c; }
+@media (prefers-color-scheme: dark) { :root { --muted: #9ca3af; --line: #374151; --up: #4ade80; --down: #f87171; } }
+body { font: 15px/1.4 system-ui, sans-serif; margin: 0 auto; padding: 16px; max-width: 1100px; }
+h1 { font-size: 1.4rem; margin: 0 0 4px; }
+h2 { font-size: 1.1rem; margin: 28px 0 8px; }
+p { color: var(--muted); margin: 4px 0; }
+.wide { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+th { font-weight: 600; white-space: nowrap; }
+td.url { overflow-wrap: anywhere; min-width: 14em; }
+.up { color: var(--up); font-weight: 600; }
+.down { color: var(--down); font-weight: 600; }
+#error { color: var(--down); }
+.note { margin-top: 24px; }
+</style>
+</head>
+<body>
+<h1>Uptime Monitor</h1>
+<p id="status">Loading saved results…</p>
+<p id="error" role="alert"></p>
+
+<h2>Endpoints</h2>
+<div class="wide"><table>
+<thead><tr><th>Targets</th><th>URL</th><th>Latest</th><th>Last checked</th><th>Up / sampled</th><th>Avg latency</th></tr></thead>
+<tbody id="endpoints"></tbody>
+</table></div>
+
+<h2>Open incidents</h2>
+<div class="wide"><table>
+<thead><tr><th>URL</th><th>Opened</th><th>Failed checks</th><th>Last checked</th></tr></thead>
+<tbody id="incidents"></tbody>
+</table></div>
+
+<p class="note">Saved observations from the last 100 checks per URL, refreshed every 30 seconds.
+They describe past checks, not whether an endpoint is up right now.</p>
+
+<script>
+"use strict";
+// Every value comes from saved data, so it is only ever inserted as text.
+const REFRESH_MS = 30000;
+
+function cell(row, text, className, title) {
+  const td = row.insertCell();
+  td.textContent = text;
+  if (className) td.className = className;
+  if (title) td.title = title;
+  return td;
+}
+
+function when(timestamp) {
+  return timestamp ? new Date(timestamp).toLocaleString() : "—";
+}
+
+function fill(id, rows, columns, emptyText) {
+  const body = document.getElementById(id);
+  body.replaceChildren();
+  for (const item of rows) {
+    const row = body.insertRow();
+    for (const [text, className, title] of columns(item)) cell(row, text, className, title);
+  }
+  if (!rows.length) cell(body.insertRow(), emptyText).colSpan = body.parentElement.tHead.rows[0].cells.length;
+}
+
+async function load(path) {
+  const response = await fetch(path, { cache: "no-store" });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || `${path} returned ${response.status}`);
+  return body;
+}
+
+function latest(summary) {
+  if (!summary) return ["not checked yet"];
+  const detail = summary.latest_error || summary.latest_status_code;
+  return [`${summary.latest_state}${detail ? ` (${detail})` : ""}`, summary.latest_state];
+}
+
+async function refresh() {
+  try {
+    const [targets, summaries, incidents] = await Promise.all(
+      ["/api/targets", "/api/summary", "/api/incidents?state=open&limit=100"].map(load));
+    const byUrl = new Map(summaries.map((summary) => [summary.url, { summary, names: [] }]));
+    for (const target of targets) {
+      if (!byUrl.has(target.url)) byUrl.set(target.url, { summary: null, names: [] });
+      byUrl.get(target.url).names.push(target.name);
+    }
+    const endpoints = [...byUrl].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    fill("endpoints", endpoints, ([url, { summary, names }]) => [
+      [names.join(", ") || "—"],
+      [url, "url"],
+      latest(summary),
+      [when(summary?.latest_checked_at), "", summary?.latest_checked_at],
+      [summary ? `${summary.up_checks} / ${summary.sampled_checks}` : "—"],
+      [summary?.up_avg_latency_ms == null ? "—" : `${summary.up_avg_latency_ms} ms`],
+    ], "No targets or saved checks yet.");
+    fill("incidents", incidents, (incident) => [
+      [incident.url, "url"],
+      [when(incident.opened_at), "", incident.opened_at],
+      [String(incident.failed_checks)],
+      [when(incident.last_checked_at), "", incident.last_checked_at],
+    ], "No open incidents.");
+    document.getElementById("status").textContent = `Updated ${new Date().toLocaleTimeString()}.`;
+    document.getElementById("error").textContent = "";
+  } catch (error) {
+    document.getElementById("error").textContent = `Could not load results: ${error.message}`;
+    const status = document.getElementById("status");
+    if (status.textContent.startsWith("Loading")) status.textContent = "No results loaded yet.";
+  }
+}
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

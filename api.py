@@ -1,4 +1,6 @@
+import base64
 from contextlib import closing
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -8,6 +10,8 @@ import sys
 from urllib.parse import parse_qs, urlsplit
 
 from incidents import list_incidents
+
+DASHBOARD = Path(__file__).resolve().with_name("dashboard.html")
 
 
 class Query:
@@ -70,14 +74,35 @@ def read_only(database: Path) -> sqlite3.Connection:
     return connection
 
 
+def dashboard_headers(page: str) -> dict:
+    # Only the page's own inline script and style may run, and it may only call this server.
+    def hashes(tag):
+        return " ".join(
+            "'sha256-" + base64.b64encode(hashlib.sha256(body.encode()).digest()).decode() + "'"
+            for body in re.findall(rf"<{tag}>(.*?)</{tag}>", page, re.DOTALL))
+    policy = (f"default-src 'none'; script-src {hashes('script')}; style-src {hashes('style')}; "
+              "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+    return {"Content-Security-Policy": policy, "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer"}
+
+
 def make_server(database: Path, host: str, port: int, store) -> ThreadingHTTPServer:
     table = routes(store)
+    # Read once on startup so a missing page fails `serve` instead of every request.
+    page = DASHBOARD.read_text(encoding="utf-8")
+    page_headers = dashboard_headers(page)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "uptime-monitor/0.1"
 
         def do_GET(self):
             parts = urlsplit(self.path)
+            if parts.path == "/":
+                try:
+                    Query(parts.query, ())
+                except ValueError as error:
+                    return self.reply(400, {"error": str(error)})
+                return self.respond(200, page.encode(), "text/html; charset=utf-8", page_headers)
             route = table.get(parts.path)
             if route is None:
                 return self.reply(404, {"error": f"No endpoint at {parts.path}."})
@@ -99,9 +124,11 @@ def make_server(database: Path, host: str, port: int, store) -> ThreadingHTTPSer
         do_POST = do_PUT = do_PATCH = do_DELETE = refuse
 
         def reply(self, status: int, body, headers: dict | None = None):
-            payload = json.dumps(body, indent=2).encode()
+            self.respond(status, json.dumps(body, indent=2).encode(), "application/json", headers)
+
+        def respond(self, status: int, payload: bytes, content_type: str, headers: dict | None = None):
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
             for name, value in (headers or {}).items():

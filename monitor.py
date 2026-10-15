@@ -391,7 +391,7 @@ def parser() -> argparse.ArgumentParser:
     incidents.add_argument("--limit", type=int, default=20)
     incidents.add_argument("--failures", type=int, default=2, help="Consecutive failures to open an incident")
     incidents.add_argument("--recoveries", type=int, default=2, help="Consecutive successes to resolve it")
-    serve = commands.add_parser("serve", help="Serve saved results as a read-only JSON API")
+    serve = commands.add_parser("serve", help="Serve a dashboard and read-only JSON API for saved results")
     serve.add_argument("--host", default="127.0.0.1", help="Address to listen on (default: 127.0.0.1)")
     serve.add_argument("--port", type=int, default=8080, help="Port to listen on, 0 for any free port (default: 8080)")
     return root
@@ -403,7 +403,7 @@ def serve(database: Path, host: str, port: int) -> None:
     # Create or upgrade the database once so every request can open it read-only.
     connect(database).close()
     with api.make_server(database, host, port, sys.modules[__name__]) as server:
-        print(f"Serving read-only API on http://{host}:{server.server_port}", file=sys.stderr, flush=True)
+        print(f"Serving dashboard and read-only API on http://{host}:{server.server_port}", file=sys.stderr, flush=True)
         server.serve_forever()
 
 
