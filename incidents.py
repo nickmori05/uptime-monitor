@@ -19,6 +19,20 @@ def list_incidents(
             raise ValueError(f"{name} must be between 1 and {maximum}.")
     if state not in (None, "open", "resolved"):
         raise ValueError("State must be open or resolved.")
+    return nlargest(
+        limit,
+        (incident for incident in scan_incidents(connection, url=url, failures=failures, recoveries=recoveries)
+         if state is None or incident["state"] == state),
+        key=lambda incident: incident["first_failure_id"],
+    )
+
+
+def scan_incidents(connection: sqlite3.Connection, *, url: str | None = None,
+                   failures: int = 2, recoveries: int = 2) -> list[dict]:
+    """Rebuild every incident from saved checks, in no particular order."""
+    for name, value in (("Failures", failures), ("Recoveries", recoveries)):
+        if type(value) is not int or not 1 <= value <= 100:
+            raise ValueError(f"{name} must be between 1 and 100.")
     query = "SELECT id, url, checked_at, state FROM checks"
     parameters = ()
     if url is not None:
@@ -26,12 +40,7 @@ def list_incidents(
         parameters = (url,)
     query += " ORDER BY id"
     with closing(connection.execute(query, parameters)) as rows:
-        return nlargest(
-            limit,
-            (incident for incident in _episodes(rows, failures, recoveries)
-             if state is None or incident["state"] == state),
-            key=lambda incident: incident["first_failure_id"],
-        )
+        return list(_episodes(rows, failures, recoveries))
 
 
 def _episodes(rows, failures: int, recoveries: int):

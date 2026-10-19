@@ -1,3 +1,4 @@
+import alerts
 import api
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -161,6 +162,19 @@ def connect(database: Path) -> sqlite3.Connection:
         connection.execute("ALTER TABLE targets ADD COLUMN deadline REAL "
                            "CHECK(deadline IS NULL OR (deadline > 0 AND deadline <= 60))")
     connection.execute("CREATE INDEX IF NOT EXISTS checks_url_id ON checks(url, id)")
+    # One row per incident event, so an alert is never sent twice for the same change.
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY,
+            url TEXT NOT NULL,
+            first_failure_id INTEGER NOT NULL,
+            event TEXT NOT NULL CHECK(event IN ('opened', 'resolved')),
+            check_id INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('sent', 'skipped')),
+            recorded_at TEXT NOT NULL,
+            UNIQUE(first_failure_id, event)
+        )"""
+    )
     connection.commit()
     return connection
 
@@ -385,6 +399,9 @@ def parser() -> argparse.ArgumentParser:
     watch.add_argument("--interval", type=float, default=30.0, help="Seconds to wait after each batch")
     watch.add_argument("--count", type=int, help="Number of batches; omit to keep watching")
     watch.add_argument("--deadline", type=float, help="Per-request limit for every target, overriding saved deadlines")
+    watch.add_argument("--alert-webhook", type=validate_url, help="POST incident openings and resolutions to this URL")
+    alert_log = commands.add_parser("alerts", help="Show sent and skipped alerts as JSON")
+    alert_log.add_argument("--limit", type=int, default=20)
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=validate_url, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"))
@@ -415,12 +432,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         with closing(connect(args.database)) as connection:
             if args.command == "watch":
+                if args.alert_webhook is not None:
+                    skipped = alerts.skip_backlog(connection)
+                    if skipped:
+                        print(f"Skipped {skipped} earlier incident event(s); alerting on new ones.",
+                              file=sys.stderr, flush=True)
                 failed = False
                 for batch in watch_targets(connection, interval=args.interval, count=args.count,
                                            workers=args.workers, deadline=args.deadline):
                     failed = failed or any(row["state"] == "down" for row in batch["results"])
                     print(json.dumps(batch), flush=True)
+                    if args.alert_webhook is not None:
+                        alerts.deliver(connection, args.alert_webhook)
                 return 1 if failed else 0
+            if args.command == "alerts":
+                print(json.dumps(alerts.list_alerts(connection, args.limit), indent=2))
+                return 0
             if args.command == "incidents":
                 results = list_incidents(
                     connection, url=args.url, state=args.state, limit=args.limit,
