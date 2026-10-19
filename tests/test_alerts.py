@@ -146,7 +146,8 @@ class AlertCommandTests(unittest.TestCase):
                                         states=["down", "down", "up", "up"])
         self.assertEqual(code, 1)
         self.assertEqual(len(output.splitlines()), 4)
-        self.assertEqual([(url, body["event"]) for url, body in self.sent], [(webhook, "opened"), (webhook, "resolved")])
+        self.assertEqual([(url, body["event"]) for url, body in self.sent],
+                         [(webhook, "opened"), (webhook, "resolved")])
         self.assertIn("Alert sent: Incident opened for https://example.com", errors)
         self.assertEqual(self.cli("watch", "--count", "1", "--alert-webhook", webhook, states=["up"])[0], 0)
         self.assertEqual(len(self.sent), 2)
@@ -157,7 +158,8 @@ class AlertCommandTests(unittest.TestCase):
 
     def test_restarted_watch_skips_incidents_from_before_alerting(self):
         self.assertEqual(self.cli("watch", "--count", "2", states=["down", "down"])[0], 1)
-        code, _, errors = self.cli("watch", "--count", "1", "--alert-webhook", "https://hooks.example/a", states=["down"])
+        code, _, errors = self.cli("watch", "--count", "1", "--alert-webhook", "https://hooks.example/a",
+                                   states=["down"])
         self.assertEqual(code, 1)
         self.assertEqual(self.sent, [])
         self.assertIn("Skipped 1 earlier incident event(s)", errors)
@@ -168,7 +170,8 @@ class AlertCommandTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
     def test_invalid_webhooks_and_limits_exit_two_without_checking(self):
-        for webhook in ("ftp://hooks.example", "https://user:secret@hooks.example", "https://hooks.example/#x", "hooks"):
+        invalid = ("ftp://hooks.example", "https://user:secret@hooks.example", "https://hooks.example/#x", "hooks")
+        for webhook in invalid:
             with self.subTest(webhook=webhook), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit:
                 monitor.main(["--database", str(self.database), "watch", "--alert-webhook", webhook])
             self.assertEqual(exit.exception.code, 2)
@@ -177,7 +180,8 @@ class AlertCommandTests(unittest.TestCase):
 
     def test_storage_errors_while_alerting_exit_two(self):
         with patch.object(alerts, "pending_alerts", side_effect=sqlite3.OperationalError("locked")):
-            code, _, errors = self.cli("watch", "--count", "1", "--alert-webhook", "https://hooks.example/a", states=["up"])
+            code, _, errors = self.cli("watch", "--count", "1", "--alert-webhook", "https://hooks.example/a",
+                                       states=["up"])
         self.assertEqual(code, 2)
         self.assertIn("locked", errors)
 

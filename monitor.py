@@ -1,5 +1,3 @@
-import alerts
-import api
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
@@ -7,12 +5,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import http.client
 import json
-from incidents import list_incidents
 import math
 from pathlib import Path
 import re
-import sqlite3
 import signal
+import sqlite3
 import sys
 import threading
 from time import perf_counter, sleep
@@ -20,6 +17,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+import alerts
+import api
+from incidents import list_incidents
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / ".local" / "checks.sqlite3"
 
@@ -331,7 +331,8 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4,
 
 def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
                   count: int | None = None, workers: int = 4, deadline: float | None = None):
-    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not math.isfinite(interval) or not 1 <= interval <= 86400:
+    if (isinstance(interval, bool) or not isinstance(interval, (int, float))
+            or not math.isfinite(interval) or not 1 <= interval <= 86400):
         raise ValueError("Interval must be between 1 and 86400 seconds.")
     if count is not None and (type(count) is not int or count < 1):
         raise ValueError("Count must be a positive integer.")
@@ -372,7 +373,8 @@ def parser() -> argparse.ArgumentParser:
     summary_target = summary.add_mutually_exclusive_group()
     summary_target.add_argument("--url", help="Only summarize this exact URL")
     summary_target.add_argument("--target", help="Summarize the URL currently saved for this target name")
-    summary.add_argument("--state", choices=("up", "down"), help="Only include endpoints whose latest saved check has this state")
+    summary.add_argument("--state", choices=("up", "down"),
+                         help="Only include endpoints whose latest saved check has this state")
     add = commands.add_parser("add", help="Save a named target without making a request")
     add.add_argument("name")
     add.add_argument("url")
