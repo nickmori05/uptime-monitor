@@ -198,6 +198,42 @@ if a target was removed. Gaps between checks are unknown. Reports scan all
 matching observations, so they are intended for local-sized histories. This is
 not an alerting system or a measurement of exact outage duration.
 
+## Alerts
+
+Send a webhook when an incident opens or resolves:
+
+```sh
+python3 monitor.py watch --interval 30 --alert-webhook https://hooks.example.com/uptime
+python3 monitor.py alerts --limit 10
+```
+
+After each batch, `watch --alert-webhook` rebuilds incidents with the default
+thresholds (two failures open one, two successes resolve it) and POSTs one JSON
+object per new event: `{"event": "opened" | "resolved", "url": ..., "text": ...,
+"incident": {...}}`. `incident` matches the `incidents` report, and `text` is a
+one-line summary. Events are sent oldest first, and any `2xx` response counts as
+delivered. Redirects are not followed.
+
+Each event is sent once. Sent events are saved in the database, so restarting
+the watcher doesn't repeat them, and flapping or further failures inside an open
+incident don't send more. Several target names for one URL share its alerts.
+If delivery fails (an error status, a connection error, or no answer within
+about 10 seconds), the reason goes to stderr and that event and the ones after
+it are retried after the next batch. Checks keep running while the webhook is down.
+
+When the watcher starts with `--alert-webhook`, incident events already in the
+history are recorded as `skipped` instead of sent, and the count is printed to
+stderr. So enabling alerts on an existing database doesn't replay old incidents,
+but an incident that opened while no alerting watcher was running is not sent
+either; use `incidents --state open` to review those. `alerts` lists sent and
+skipped events, newest first (default 20, maximum 1,000). Databases from earlier
+versions gain the empty alert table automatically.
+
+The webhook URL may carry a token in its path or query, but not a username or
+password. It is not saved, and delivery messages never include it. There is no
+retry backoff, no per-target thresholds, and no built-in format for a particular
+chat service beyond the `text` field.
+
 ## Check summaries
 
 After leaving the watcher running, use `summary` to see how each endpoint did:
@@ -326,6 +362,9 @@ docker compose run --rm monitor remove example
 docker compose stop monitor
 ```
 
+To send alerts from the container, add `--alert-webhook URL` to the `command`
+in `compose.yml`; the Compose network must be able to reach the webhook.
+
 Add at least one target before starting the watcher. It exits when no targets
 remain and does not automatically restart; after adding new targets, run
 `docker compose up -d monitor` again. No inbound ports are published. Inside the
@@ -345,8 +384,10 @@ python3 scripts/docker_smoke.py
 It builds an isolated image, uses a temporary Compose project and volume, and
 checks two failures followed by two recoveries against a fixture on an internal
 network. It also checks non-root execution, persistence across containers, and
-SIGTERM shutdown, that a slow response is cut off by `--deadline`, and that the
-API and dashboard serve the watcher's history from another container. Its temporary containers, network, volume, and image are
+SIGTERM shutdown, that a slow response is cut off by `--deadline`, that the
+opening and resolution alerts reach a webhook once even after the watcher
+restarts, and that the API and dashboard serve the watcher's history from
+another container. Its temporary containers, network, volume, and image are
 removed afterward; your regular monitor volume is not used.
 
 ## Storage
@@ -393,6 +434,10 @@ Dashboard tests cover the served page and its headers, that the security policy
 matches the page's inline script and style, that every API path the page reads
 is answered, that saved values are only inserted as text, rejected queries and
 methods, and a missing page file.
+Alert tests cover one webhook per opening and resolution, no repeats for flapping
+or restarts, skipped backlogs, retrying failed deliveries in order, upgrading an
+older database, and real deliveries to a local receiver that answers with
+success, errors, redirects, or too slowly.
 
 GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration check.
 
@@ -405,6 +450,7 @@ GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration
 - `run_targets`: run requests concurrently and save completed checks on the caller's connection.
 - `watch_targets`: repeat batches with a delay and fresh settings each round.
 - `list_incidents`: derive failure and recovery episodes from saved observations.
+- `alerts.deliver`: send each new incident opening or resolution to a webhook once.
 - `serve` and `api.make_server`: answer read-only JSON requests from saved data.
 - `dashboard.html`: the static page `serve` returns at `/`, built on the JSON API.
 - `main`: parse commands, print JSON, and return exit codes.
@@ -416,13 +462,16 @@ would require an explicit concurrency, access, and network-boundary design.
 
 The current release runs individual checks, batches, and a foreground watcher,
 derives incident reports from their history, and serves them through a local
-read-only API and dashboard. It has no alerts or authenticated hosted API, and
-does not calculate uptime percentages from sparse observations.
+read-only API and dashboard, and can send deduplicated webhook alerts. It has no
+authenticated hosted API and does not calculate uptime percentages from sparse
+observations.
 
 Next milestones:
 
 1. ~~Add an API and a small dashboard for viewing results.~~ Done: `serve`
    provides the read-only JSON API and a dashboard at `/`.
-2. Add alert deduplication and measured reliability tests.
+2. Add alert deduplication and measured reliability tests. Alert deduplication
+   is done: `watch --alert-webhook` sends each incident change once. Measured
+   reliability tests remain.
 3. ~~Consider saving a default deadline with each target.~~ Done: `add` and
    `update` accept `--deadline`, and runs use it unless overridden.
