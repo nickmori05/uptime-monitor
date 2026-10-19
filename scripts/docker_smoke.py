@@ -1,3 +1,5 @@
+"""Build the image and check the watcher, alerts, API, and dashboard end to end with Docker Compose."""
+
 import json
 import os
 from pathlib import Path

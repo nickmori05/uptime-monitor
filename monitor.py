@@ -1,3 +1,5 @@
+"""Check HTTP endpoints, save each observation to SQLite, and report on the history."""
+
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
@@ -26,6 +28,7 @@ DEFAULT_DATABASE = Path(__file__).resolve().parent / ".local" / "checks.sqlite3"
 
 @dataclass(frozen=True)
 class Check:
+    """One saved observation of an endpoint."""
     url: str
     checked_at: str
     state: str
@@ -35,11 +38,14 @@ class Check:
 
 
 class NoRedirects(HTTPRedirectHandler):
+    """Report redirects as responses instead of following them."""
+
     def redirect_request(self, request, response, code, message, headers, new_url):
         return None
 
 
 def validate_url(value: str) -> str:
+    """Return the URL if it is an absolute http(s) URL that can be sent as-is, else raise ValueError."""
     if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
         raise ValueError("URLs must not contain whitespace or control characters.")
     try:
@@ -60,12 +66,14 @@ def validate_url(value: str) -> str:
 
 
 def validate_timeout(timeout: float) -> float:
+    """Return the socket timeout if it is in (0, 60] seconds, else raise ValueError."""
     if not math.isfinite(timeout) or not 0 < timeout <= 60:
         raise ValueError("Timeout must be greater than 0 and at most 60 seconds.")
     return timeout
 
 
 def validate_deadline(deadline: float | None) -> float | None:
+    """Return the whole-request deadline (or None) if it is in (0, 60] seconds, else raise ValueError."""
     if deadline is None:
         return None
     if isinstance(deadline, bool) or not math.isfinite(deadline) or not 0 < deadline <= 60:
@@ -74,6 +82,7 @@ def validate_deadline(deadline: float | None) -> float | None:
 
 
 def request_status(url: str, timeout: float) -> tuple[int | None, str | None]:
+    """Send one GET and return its status code, or None and an error code if it failed."""
     request = Request(url, headers={"User-Agent": "uptime-monitor/0.1"}, method="GET")
     try:
         with build_opener(NoRedirects()).open(request, timeout=timeout) as response:
@@ -92,6 +101,7 @@ def request_status(url: str, timeout: float) -> tuple[int | None, str | None]:
 def request_within(url: str, timeout: float, deadline: float) -> tuple[int | None, str | None]:
     # DNS lookups and slow servers can outlast the socket timeout, so the request
     # runs on a daemon thread that is abandoned once the deadline passes.
+    """Run `request_status`, giving up with `deadline_exceeded` once the deadline passes."""
     outcome = []
 
     def attempt():
@@ -111,6 +121,7 @@ def request_within(url: str, timeout: float, deadline: float) -> tuple[int | Non
 
 
 def probe(url: str, timeout: float = 5.0, deadline: float | None = None) -> Check:
+    """Check a URL once and classify the result as up (2xx) or down. Nothing is saved."""
     url = validate_url(url)
     timeout = validate_timeout(timeout)
     deadline = validate_deadline(deadline)
@@ -134,6 +145,7 @@ def probe(url: str, timeout: float = 5.0, deadline: float | None = None) -> Chec
 
 
 def connect(database: Path) -> sqlite3.Connection:
+    """Open the database, creating or upgrading its tables as needed."""
     database.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
@@ -180,6 +192,7 @@ def connect(database: Path) -> sqlite3.Connection:
 
 
 def save(connection: sqlite3.Connection, result: Check) -> int:
+    """Store one observation and return its row ID."""
     with connection:
         cursor = connection.execute(
             """INSERT INTO checks (url, checked_at, state, status_code, latency_ms, error)
@@ -190,6 +203,7 @@ def save(connection: sqlite3.Connection, result: Check) -> int:
 
 
 def history(connection: sqlite3.Connection, limit: int = 20, url: str | None = None) -> list[dict]:
+    """Return saved observations newest first, optionally for one exact URL."""
     if not 1 <= limit <= 1000:
         raise ValueError("History limit must be between 1 and 1000.")
     if url is not None:
@@ -208,6 +222,7 @@ def history(connection: sqlite3.Connection, limit: int = 20, url: str | None = N
 
 def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None = None,
               *, state: str | None = None) -> list[dict]:
+    """Summarize the most recent `last` observations for each URL."""
     if type(last) is not int or not 1 <= last <= 10000:
         raise ValueError("Summary sample size must be between 1 and 10000.")
     if state is not None and state not in ("up", "down"):
@@ -239,6 +254,7 @@ def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None =
 
 def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: float = 5.0,
                deadline: float | None = None) -> dict:
+    """Save a new named target without checking it."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
         raise ValueError("Name must be 1–64 letters, digits, hyphens, or underscores, starting with a letter or digit.")
     url = validate_url(url)
@@ -254,6 +270,7 @@ def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: flo
 
 
 def get_target(connection: sqlite3.Connection, name: str) -> dict:
+    """Return a saved target by name, or raise ValueError if it doesn't exist."""
     row = connection.execute("SELECT * FROM targets WHERE name = ?", (name,)).fetchone()
     if row is None:
         raise ValueError(f"Target '{name}' does not exist.")
@@ -261,12 +278,14 @@ def get_target(connection: sqlite3.Connection, name: str) -> dict:
 
 
 def list_targets(connection: sqlite3.Connection) -> list[dict]:
+    """Return every saved target, sorted by name."""
     return [dict(row) for row in connection.execute("SELECT * FROM targets ORDER BY name")]
 
 
 def update_target(connection: sqlite3.Connection, name: str, *,
                   url: str | None = None, timeout: float | None = None,
                   deadline: float | None = None, clear_deadline: bool = False) -> dict:
+    """Change a saved target's URL, timeout, or deadline, keeping settings that aren't given."""
     if deadline is not None and clear_deadline:
         raise ValueError("Choose either a new deadline or clearing it, not both.")
     if url is None and timeout is None and deadline is None and not clear_deadline:
@@ -289,6 +308,7 @@ def update_target(connection: sqlite3.Connection, name: str, *,
 
 
 def remove_target(connection: sqlite3.Connection, name: str) -> dict:
+    """Delete a saved target's settings. Its past observations are kept."""
     with connection:
         cursor = connection.execute("DELETE FROM targets WHERE name = ?", (name,))
         if cursor.rowcount == 0:
@@ -298,11 +318,13 @@ def remove_target(connection: sqlite3.Connection, name: str) -> dict:
 
 def target_deadline(target: dict, override: float | None = None) -> float | None:
     # A deadline given for one run replaces the target's saved default.
+    """Return the deadline for one run: the override if given, else the target's saved default."""
     return override if override is not None else target["deadline"]
 
 
 def run_targets(connection: sqlite3.Connection, workers: int = 4,
                 deadline: float | None = None) -> list[dict]:
+    """Check every saved target once, `workers` at a time, saving each result on this connection."""
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("Workers must be between 1 and 32.")
     deadline = validate_deadline(deadline)
@@ -331,6 +353,7 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4,
 
 def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
                   count: int | None = None, workers: int = 4, deadline: float | None = None):
+    """Yield one batch of results per round, waiting `interval` seconds between rounds."""
     if (isinstance(interval, bool) or not isinstance(interval, (int, float))
             or not math.isfinite(interval) or not 1 <= interval <= 86400):
         raise ValueError("Interval must be between 1 and 86400 seconds.")
@@ -350,23 +373,34 @@ def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
 
 
 class ShutdownRequested(BaseException):
-    pass
+    """Raised from the SIGTERM handler to stop the command cleanly."""
 
 
 def terminate(signum, frame):
+    """SIGTERM handler that turns the signal into `ShutdownRequested`."""
     raise ShutdownRequested()
 
 
+def url_argument(value: str) -> str:
+    """Validate a URL option, letting argparse show the reason it was rejected."""
+    try:
+        return validate_url(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def parser() -> argparse.ArgumentParser:
+    """Build the command-line parser."""
     root = argparse.ArgumentParser(description="Check HTTP endpoints and keep a local history.")
-    root.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
+    root.add_argument("--database", type=Path, default=DEFAULT_DATABASE,
+                      help="SQLite file to use (default: .local/checks.sqlite3 next to monitor.py)")
     commands = root.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check", help="Check a URL once and save the result")
     check.add_argument("url")
     check.add_argument("--timeout", type=float, default=5.0, help="Socket timeout in seconds (default: 5)")
     check.add_argument("--deadline", type=float, help="Give up on the whole request after this many seconds")
     listing = commands.add_parser("history", help="Show recent saved checks as JSON")
-    listing.add_argument("--limit", type=int, default=20)
+    listing.add_argument("--limit", type=int, default=20, help="Checks to show, 1–1000 (default: 20)")
     listing.add_argument("--url", help="Only show checks for this exact URL")
     summary = commands.add_parser("summary", help="Summarize saved checks per endpoint without making requests")
     summary.add_argument("--last", type=int, default=100, help="Recent checks per URL, 1–10000 (default: 100)")
@@ -378,12 +412,12 @@ def parser() -> argparse.ArgumentParser:
     add = commands.add_parser("add", help="Save a named target without making a request")
     add.add_argument("name")
     add.add_argument("url")
-    add.add_argument("--timeout", type=float, default=5.0)
+    add.add_argument("--timeout", type=float, default=5.0, help="Socket timeout in seconds (default: 5)")
     add.add_argument("--deadline", type=float, help="Default whole-request limit for this target's runs")
     update = commands.add_parser("update", help="Change a saved target's URL, timeout, or deadline")
     update.add_argument("name")
-    update.add_argument("--url")
-    update.add_argument("--timeout", type=float)
+    update.add_argument("--url", help="Save a new URL")
+    update.add_argument("--timeout", type=float, help="Save a new socket timeout")
     update_deadline = update.add_mutually_exclusive_group()
     update_deadline.add_argument("--deadline", type=float, help="Save a new default deadline")
     update_deadline.add_argument("--no-deadline", action="store_true", help="Clear the saved deadline")
@@ -397,17 +431,17 @@ def parser() -> argparse.ArgumentParser:
     batch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
     batch.add_argument("--deadline", type=float, help="Per-request limit for every target, overriding saved deadlines")
     watch = commands.add_parser("watch", help="Repeat batches until stopped or the count is reached")
-    watch.add_argument("--workers", type=int, default=4)
+    watch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
     watch.add_argument("--interval", type=float, default=30.0, help="Seconds to wait after each batch")
     watch.add_argument("--count", type=int, help="Number of batches; omit to keep watching")
     watch.add_argument("--deadline", type=float, help="Per-request limit for every target, overriding saved deadlines")
-    watch.add_argument("--alert-webhook", type=validate_url, help="POST incident openings and resolutions to this URL")
+    watch.add_argument("--alert-webhook", type=url_argument, help="POST incident openings and resolutions to this URL")
     alert_log = commands.add_parser("alerts", help="Show sent and skipped alerts as JSON")
-    alert_log.add_argument("--limit", type=int, default=20)
+    alert_log.add_argument("--limit", type=int, default=20, help="Alerts to show, 1–1000 (default: 20)")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
-    incidents.add_argument("--url", type=validate_url, help="Only report this exact URL")
-    incidents.add_argument("--state", choices=("open", "resolved"))
-    incidents.add_argument("--limit", type=int, default=20)
+    incidents.add_argument("--url", type=url_argument, help="Only report this exact URL")
+    incidents.add_argument("--state", choices=("open", "resolved"), help="Only report open or resolved incidents")
+    incidents.add_argument("--limit", type=int, default=20, help="Incidents to show, 1–1000 (default: 20)")
     incidents.add_argument("--failures", type=int, default=2, help="Consecutive failures to open an incident")
     incidents.add_argument("--recoveries", type=int, default=2, help="Consecutive successes to resolve it")
     serve = commands.add_parser("serve", help="Serve a dashboard and read-only JSON API for saved results")
@@ -417,6 +451,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def serve(database: Path, host: str, port: int) -> None:
+    """Serve the dashboard and read-only API until interrupted."""
     if type(port) is not int or not 0 <= port <= 65535:
         raise ValueError("Port must be between 0 and 65535.")
     # Create or upgrade the database once so every request can open it read-only.
@@ -427,6 +462,7 @@ def serve(database: Path, host: str, port: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run one command and return its exit code."""
     args = parser().parse_args(argv)
     try:
         if args.command == "serve":

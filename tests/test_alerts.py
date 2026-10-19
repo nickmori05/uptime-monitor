@@ -172,9 +172,13 @@ class AlertCommandTests(unittest.TestCase):
     def test_invalid_webhooks_and_limits_exit_two_without_checking(self):
         invalid = ("ftp://hooks.example", "https://user:secret@hooks.example", "https://hooks.example/#x", "hooks")
         for webhook in invalid:
-            with self.subTest(webhook=webhook), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit:
+            errors = io.StringIO()
+            with self.subTest(webhook=webhook), redirect_stderr(errors), self.assertRaises(SystemExit) as exit:
                 monitor.main(["--database", str(self.database), "watch", "--alert-webhook", webhook])
             self.assertEqual(exit.exception.code, 2)
+            self.assertIn("argument --alert-webhook: ", errors.getvalue())
+            self.assertNotIn("invalid url_argument value", errors.getvalue())
+            self.assertNotIn("secret", errors.getvalue())
         self.assertEqual(self.cli("alerts", "--limit", "0")[0], 2)
         self.assertEqual(self.sent, [])
 
