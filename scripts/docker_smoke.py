@@ -33,7 +33,8 @@ def main():
         uid = run(["run", "--rm", "--no-deps", "--entrypoint", "id", "monitor", "-u"]).strip()
         assert uid == "10001", uid
         command("add", "service", "http://fixture:8000/service", "--timeout", "2")
-        output = command("watch", "--interval", "1", "--count", "4", expected=1)
+        webhook = "http://fixture:8000/webhook"
+        output = command("watch", "--interval", "1", "--count", "4", "--alert-webhook", webhook, expected=1)
         batches = [json.loads(line) for line in output.splitlines()]
         assert [batch["cycle"] for batch in batches] == [1, 2, 3, 4], batches
         assert [batch["results"][0]["state"] for batch in batches] == ["down", "down", "up", "up"], batches
@@ -52,6 +53,16 @@ def main():
         assert len(json.loads(command("history"))) == 4
         print("Failure, recovery, and persistence across containers passed.", flush=True)
 
+        command("watch", "--interval", "1", "--count", "1", "--alert-webhook", webhook)
+        received = json.loads(run(["exec", "-T", "fixture", "python", "-c", "import urllib.request; "
+                                   "print(urllib.request.urlopen('http://127.0.0.1:8000/alerts').read().decode())"]))
+        assert [(alert["event"], alert["url"]) for alert in received] == [
+            ("opened", "http://fixture:8000/service"), ("resolved", "http://fixture:8000/service")], received
+        assert received[1]["incident"]["resolution_check_id"] == incident["resolution_check_id"], received
+        logged = json.loads(command("alerts"))
+        assert [(row["event"], row["status"]) for row in logged] == [("resolved", "sent"), ("opened", "sent")], logged
+        print("Webhook alerts sent once across restarts passed.", flush=True)
+
         run(["up", "--detach", "--no-deps", "monitor"])
         deadline = time.monotonic() + 20
         while True:
@@ -66,7 +77,7 @@ def main():
         inspected = subprocess.run(["docker", "inspect", container], text=True, capture_output=True, check=True, timeout=30)
         state = json.loads(inspected.stdout)[0]["State"]
         assert state["ExitCode"] == 143 and not state["Running"], state
-        assert len(json.loads(command("history"))) == 5
+        assert len(json.loads(command("history"))) == 6
         assert json.loads(command("incidents")) == [incident]
         print("SIGTERM shutdown and saved history passed.", flush=True)
 
@@ -87,11 +98,11 @@ def main():
                  "print(response.read().decode())")
         api = f"http://{project}-api:8080/api"
         served, = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/summary?target=service"]))
-        assert (served["stored_checks"], served["latest_state"]) == (5, "up"), served
+        assert (served["stored_checks"], served["latest_state"]) == (6, "up"), served
         assert json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/incidents"])) == [incident]
         page = run(["exec", "-T", "fixture", "python", "-c", fetch, f"http://{project}-api:8080/"])
         assert "<title>Uptime Monitor</title>" in page and "/api/summary" in page, page[:200]
-        assert len(json.loads(command("history", "--limit", "100"))) == 6
+        assert len(json.loads(command("history", "--limit", "100"))) == 7
         print("Read-only API and dashboard passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
