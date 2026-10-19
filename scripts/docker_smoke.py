@@ -89,8 +89,10 @@ def main():
         served, = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/summary?target=service"]))
         assert (served["stored_checks"], served["latest_state"]) == (5, "up"), served
         assert json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/incidents"])) == [incident]
+        page = run(["exec", "-T", "fixture", "python", "-c", fetch, f"http://{project}-api:8080/"])
+        assert "<title>Uptime Monitor</title>" in page and "/api/summary" in page, page[:200]
         assert len(json.loads(command("history", "--limit", "100"))) == 6
-        print("Read-only API passed.", flush=True)
+        print("Read-only API and dashboard passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)

@@ -270,6 +270,35 @@ There is no authentication or TLS. Keep the default loopback address unless the
 network is trusted: anyone who can reach the port can read every saved URL and
 result. The Compose file does not publish a port for it.
 
+## Dashboard
+
+`serve` also answers `/` with a small dashboard page. Open
+<http://127.0.0.1:8080/> in a browser while it runs:
+
+```sh
+python3 monitor.py serve
+```
+
+The page lists every saved target and checked URL with its target names, latest
+result, last check time, up checks out of the sampled checks, and average
+latency of successful checks. A second table lists open incidents. It reads
+`/api/targets`, `/api/summary`, and `/api/incidents?state=open&limit=100`
+with the default sample size and thresholds, and refreshes every 30 seconds. Targets
+that haven't been checked yet show as `not checked yet`. If a refresh fails, the
+page shows the error and keeps the last results it loaded.
+
+The page is one static file, `dashboard.html`, read once when `serve` starts; if
+it's missing, `serve` exits `2`. It has no build step, external scripts, fonts,
+or images. Saved URLs and errors are only inserted as text, and a Content
+Security Policy lets just the page's own inline script and style run and only
+call back to the same server. `/` accepts no query parameters (`400`), and
+other paths keep their JSON `404`.
+
+Like the API, the dashboard is read-only and unauthenticated, so the same
+loopback advice applies. It shows saved observations, not live health; times are
+shown in the browser's time zone. There are no charts, per-URL history views, or
+controls for changing targets.
+
 ## Docker
 
 ```sh
@@ -317,7 +346,7 @@ It builds an isolated image, uses a temporary Compose project and volume, and
 checks two failures followed by two recoveries against a fixture on an internal
 network. It also checks non-root execution, persistence across containers, and
 SIGTERM shutdown, that a slow response is cut off by `--deadline`, and that the
-API serves the watcher's history from another container. Its temporary containers, network, volume, and image are
+API and dashboard serve the watcher's history from another container. Its temporary containers, network, volume, and image are
 removed afterward; your regular monitor volume is not used.
 
 ## Storage
@@ -360,6 +389,10 @@ exact URL matching, clock changes, and reading history without making requests.
 API tests compare every endpoint with its command, cover filters, invalid and
 unknown parameters, unknown paths and write methods, storage errors, read-only
 database access, port errors, upgrading an older database, and signal shutdown.
+Dashboard tests cover the served page and its headers, that the security policy
+matches the page's inline script and style, that every API path the page reads
+is answered, that saved values are only inserted as text, rejected queries and
+methods, and a missing page file.
 
 GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration check.
 
@@ -373,6 +406,7 @@ GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration
 - `watch_targets`: repeat batches with a delay and fresh settings each round.
 - `list_incidents`: derive failure and recovery episodes from saved observations.
 - `serve` and `api.make_server`: answer read-only JSON requests from saved data.
+- `dashboard.html`: the static page `serve` returns at `/`, built on the JSON API.
 - `main`: parse commands, print JSON, and return exit codes.
 
 SQLite keeps the initial local workflow reproducible. A future shared service
@@ -382,13 +416,13 @@ would require an explicit concurrency, access, and network-boundary design.
 
 The current release runs individual checks, batches, and a foreground watcher,
 derives incident reports from their history, and serves them through a local
-read-only API. It has no alerts, dashboard, or authenticated hosted API, and does
-not calculate uptime percentages from sparse observations.
+read-only API and dashboard. It has no alerts or authenticated hosted API, and
+does not calculate uptime percentages from sparse observations.
 
 Next milestones:
 
-1. Add an API and a small dashboard for viewing results. The read-only JSON API
-   is done (`serve`); the dashboard remains.
+1. ~~Add an API and a small dashboard for viewing results.~~ Done: `serve`
+   provides the read-only JSON API and a dashboard at `/`.
 2. Add alert deduplication and measured reliability tests.
 3. ~~Consider saving a default deadline with each target.~~ Done: `add` and
    `update` accept `--deadline`, and runs use it unless overridden.
