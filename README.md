@@ -124,6 +124,7 @@ unknown.
 ```sh
 python3 monitor.py watch --interval 30 --alert-webhook https://hooks.example.com/uptime
 python3 monitor.py alerts
+python3 monitor.py alerts --pending
 ```
 
 With `--alert-webhook`, the watcher POSTs one JSON object after each round for
@@ -138,9 +139,16 @@ report. Each event is sent once: sent events are saved in the database, so
 restarts, flapping, and further failures don't repeat them, and several targets
 for one URL share alerts. A delivery that fails (non-`2xx`, redirect, connection
 error, or no answer within about 10 seconds) is logged to stderr and retried
-after the next round, in order. Events that were already in the history when
-the watcher started are recorded as `skipped` instead of sent. `alerts` lists
-sent and skipped events, newest first.
+after the next round, in order.
+
+The first time a watcher starts with `--alert-webhook`, events already in the
+history are recorded as `skipped` instead of sent, so turning alerts on doesn't
+replay old incidents. From then on nothing is skipped: events from checks made
+while no alerting watcher was running (it was stopped, ran without the flag, or
+checks came from `run` or `run-all`) are sent when the next alerting watcher
+starts, oldest first, before its first round. `alerts` lists sent and skipped
+events, newest first, and `alerts --pending` lists the events the next alerting
+watcher will send, in order.
 
 ### API and dashboard
 
@@ -191,12 +199,14 @@ container itself. To send alerts, add `--alert-webhook URL` to the service
 - `alerts.py`: finds unsent incident events and delivers them to a webhook.
 - `api.py` and `dashboard.html`: the read-only HTTP API and the static dashboard.
 
-All state lives in one SQLite file with three tables: `checks` (one row per
-observation), `targets`, and `alerts` (one row per sent or skipped incident
-event, unique per event). Incidents and summaries are derived from `checks` on
-demand rather than stored, and checks are ordered by row ID rather than by
-timestamp, so a clock change can't reorder history. `connect` creates missing
-tables and columns, so databases from earlier versions upgrade in place.
+All state lives in one SQLite file with four tables: `checks` (one row per
+observation), `targets`, `alerts` (one row per sent or skipped incident event,
+unique per event), and `alerting` (a single row saving the last check from
+before alerts were first enabled; every event after it is owed an alert).
+Incidents and summaries are derived from `checks` on demand rather than stored,
+and checks are ordered by row ID rather than by timestamp, so a clock change
+can't reorder history. `connect` creates missing tables and columns, so
+databases from earlier versions upgrade in place.
 
 Requests run on worker threads while the calling thread does every database
 write, which keeps SQLite on one connection. Deadlines (and webhook deliveries)
@@ -215,15 +225,16 @@ python3 scripts/docker_smoke.py
 The unit tests use a temporary local HTTP server and temporary databases, with
 connection failures and hung lookups injected, so they need no network access.
 They cover checks and deadlines, targets, batches and their concurrency limit,
-the watcher and its signal handling, incidents, summaries, alerts and webhook
-delivery, the API, the dashboard's headers and policy, and upgrading older
-databases.
+the watcher and its signal handling, incidents, summaries, alerts, webhook
+delivery, and catching up on missed alerts, the API, the dashboard's headers and
+policy, and upgrading older databases.
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
 network: non-root execution, persistence across containers, SIGTERM shutdown,
-deadlines, webhook alerts sent once across restarts, and the API and dashboard
-served from another container. Everything it creates is removed afterward.
+deadlines, webhook alerts sent once across restarts, the API and dashboard
+served from another container, and an alert for an incident that opened while
+no watcher was running. Everything it creates is removed afterward.
 
 GitHub Actions runs `ruff check`, the unit tests on Python 3.10 and 3.14, and
 the Docker smoke test. Lint settings are in `pyproject.toml`.
@@ -235,8 +246,11 @@ the Docker smoke test. Lint settings are in `pyproject.toml`.
 - Observations are point-in-time samples; there are no uptime percentages or
   exact outage durations.
 - The socket timeout alone doesn't bound DNS lookups; use a deadline for that.
-- Alerts use the default incident thresholds and have no backoff. Incidents that
-  opened while no alerting watcher was running are skipped, not sent.
+- Alerts use the default incident thresholds and have no backoff. Events missed
+  while no watcher was running are only sent once an alerting watcher starts,
+  and after a long gap that includes incidents that have since resolved.
+  Databases that used alerts before `alerting` existed skip their unsent
+  events once more on the next start.
 - The API and dashboard have no authentication, TLS, or write access.
 
 ## Roadmap
