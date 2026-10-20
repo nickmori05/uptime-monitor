@@ -139,7 +139,10 @@ report. Each event is sent once: sent events are saved in the database, so
 restarts, flapping, and further failures don't repeat them, and several targets
 for one URL share alerts. A delivery that fails (non-`2xx`, redirect, connection
 error, or no answer within about 10 seconds) is logged to stderr and retried
-after the next round, in order.
+after the next round, in order. A watcher killed after the receiver accepts an
+alert but before saving that it did sends the alert again when it restarts, so
+receivers that must not repeat an action can deduplicate on
+`incident.first_failure_id` and `event`.
 
 The first time a watcher starts with `--alert-webhook`, events already in the
 history are recorded as `skipped` instead of sent, so turning alerts on doesn't
@@ -219,6 +222,7 @@ can run beside a watcher on the same file.
 
 ```sh
 python3 -m unittest discover -s tests -v
+python3 scripts/reliability.py
 python3 scripts/docker_smoke.py
 ```
 
@@ -236,8 +240,31 @@ deadlines, webhook alerts sent once across restarts, the API and dashboard
 served from another container, and an alert for an incident that opened while
 no watcher was running. Everything it creates is removed afterward.
 
-GitHub Actions runs `ruff check`, the unit tests on Python 3.10 and 3.14, and
-the Docker smoke test. Lint settings are in `pyproject.toml`.
+GitHub Actions runs `ruff check`, the unit tests and the reliability report on
+Python 3.10 and 3.14, and the Docker smoke test. Lint settings are in
+`pyproject.toml`.
+
+### Measured reliability
+
+`scripts/reliability.py` runs seeded scenarios against the real monitor, with
+faults injected by local servers (`tests/faults.py`), and prints one JSON report
+per scenario. It exits `1` if any guarantee fails; `--seed` and `--rounds`
+change the run. Expected incidents come from a separate implementation of the
+incident rules in `tests/scenarios.py`, which the tests cross-check against
+`incidents.py`. The unit tests run the same scenarios at a smaller size, and
+also confirm that the probe and alert scenarios fail when a bug is injected
+(ignored deadlines, or dropped, repeated, or reordered alerts).
+
+| Scenario | What it does | Measured (seed 1, defaults) |
+| --- | --- | --- |
+| Probe faults | 8 targets for 20 rounds, each check given one of: `2xx`, `503`, redirect, dropped connection, non-HTTP reply, headers slower than the timeout, headers trickled one byte at a time, or a hung DNS lookup. Timeout 0.15 s, deadline 0.3 s. | 160 checks, 0 misclassified, worst check 29 ms over its limit, slowest round 0.33 s |
+| Alert delivery | 3 targets with random outages for 202 rounds; the webhook fails (`500` or dropped connection) in 55 rounds; the watcher restarts 46 times; 36 rounds are checked by `run-all` with no watcher. | 80 alerts expected, 80 delivered, 0 lost, 0 repeated, 0 out of order, every one at the first round it could be |
+| Crash recovery | 43 rounds, each a new watcher process; 10 were killed with SIGKILL at a random point. | 22 alerts expected, 0 lost, 2 sent again after a kill, database integrity `ok` |
+| Kill during delivery | Kills the watcher after the receiver reads an alert, before it answers. | Received twice, recorded as sent once |
+
+Timing limits allow 250 ms of slack for slow machines. The numbers above are
+from one run on a laptop. For a given seed the probe and alert counts are the
+same on every run; timings, and how many kills land and where, vary.
 
 ## Limitations
 
@@ -246,6 +273,8 @@ the Docker smoke test. Lint settings are in `pyproject.toml`.
 - Observations are point-in-time samples; there are no uptime percentages or
   exact outage durations.
 - The socket timeout alone doesn't bound DNS lookups; use a deadline for that.
+- Alert delivery is at least once: a watcher killed mid-delivery repeats that
+  alert after restarting (2 of 22 alerts in the crash scenario above).
 - Alerts use the default incident thresholds and have no backoff. Events missed
   while no watcher was running are only sent once an alerting watcher starts,
   and after a long gap that includes incidents that have since resolved.
@@ -256,6 +285,6 @@ the Docker smoke test. Lint settings are in `pyproject.toml`.
 ## Roadmap
 
 1. ~~Add an API and a small dashboard for viewing results.~~ Done: `serve`.
-2. Add alert deduplication and measured reliability tests. Alert deduplication
-   is done (`watch --alert-webhook`); measured reliability tests remain.
+2. ~~Add alert deduplication and measured reliability tests.~~ Done:
+   `watch --alert-webhook` and `scripts/reliability.py`.
 3. ~~Save a default deadline with each target.~~ Done: `add --deadline`.
