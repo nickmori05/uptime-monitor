@@ -1,0 +1,121 @@
+from datetime import datetime, timezone
+import http.client
+import json
+import sqlite3
+import sys
+import threading
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from incidents import scan_incidents
+
+WEBHOOK_TIMEOUT = 5.0
+WEBHOOK_DEADLINE = 10.0
+
+
+class NoRedirects(HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def incident_events(connection: sqlite3.Connection) -> list[dict]:
+    """List every incident opening and resolution in saved history, oldest first."""
+    events = []
+    for incident in scan_incidents(connection):
+        events.append({"event": "opened", "check_id": incident["confirmation_check_id"], "incident": incident})
+        if incident["state"] == "resolved":
+            events.append({"event": "resolved", "check_id": incident["resolution_check_id"], "incident": incident})
+    return sorted(events, key=lambda event: event["check_id"])
+
+
+def pending_alerts(connection: sqlite3.Connection) -> list[dict]:
+    """Return incident events that have not been sent or skipped yet."""
+    recorded = {(row["first_failure_id"], row["event"])
+                for row in connection.execute("SELECT first_failure_id, event FROM alerts")}
+    return [event for event in incident_events(connection)
+            if (event["incident"]["first_failure_id"], event["event"]) not in recorded]
+
+
+def record(connection: sqlite3.Connection, events: list[dict], status: str) -> None:
+    recorded_at = datetime.now(timezone.utc).isoformat()
+    with connection:
+        connection.executemany(
+            """INSERT INTO alerts (url, first_failure_id, event, check_id, status, recorded_at)
+               VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(first_failure_id, event) DO NOTHING""",
+            [(event["incident"]["url"], event["incident"]["first_failure_id"], event["event"],
+              event["check_id"], status, recorded_at) for event in events],
+        )
+
+
+def skip_backlog(connection: sqlite3.Connection) -> int:
+    """Mark events that happened before alerting started so they are never sent."""
+    events = pending_alerts(connection)
+    record(connection, events, "skipped")
+    return len(events)
+
+
+def payload(event: dict) -> dict:
+    incident = event["incident"]
+    if event["event"] == "opened":
+        text = f"Incident opened for {incident['url']}: failing since {incident['opened_at']}."
+    else:
+        text = f"Incident resolved for {incident['url']}: recovered at {incident['resolved_at']}."
+    return {"event": event["event"], "url": incident["url"], "text": text, "incident": incident}
+
+
+def post(webhook: str, body: dict, timeout: float) -> str | None:
+    request = Request(webhook, data=json.dumps(body).encode(), method="POST",
+                      headers={"Content-Type": "application/json", "User-Agent": "uptime-monitor/0.1"})
+    try:
+        with build_opener(NoRedirects()).open(request, timeout=timeout) as response:
+            status = response.status
+    except HTTPError as response:
+        response.close()
+        status = response.code
+    except TimeoutError:
+        return "timeout"
+    except URLError as failure:
+        return "timeout" if isinstance(failure.reason, TimeoutError) else "connection_error"
+    except (OSError, http.client.HTTPException):
+        return "connection_error"
+    return None if 200 <= status < 300 else f"http_{status}"
+
+
+def send_webhook(webhook: str, body: dict, timeout: float = WEBHOOK_TIMEOUT,
+                 deadline: float = WEBHOOK_DEADLINE) -> str | None:
+    """POST one alert as JSON. Return None when accepted, or a short error code."""
+    # Like probe deadlines, a hung DNS lookup is abandoned on a daemon thread.
+    outcome = []
+
+    def attempt():
+        try:
+            outcome.append(post(webhook, body, timeout))
+        except Exception:
+            outcome.append("connection_error")
+
+    worker = threading.Thread(target=attempt, name="alert-webhook", daemon=True)
+    worker.start()
+    worker.join(deadline)
+    return outcome[0] if outcome else "deadline_exceeded"
+
+
+def deliver(connection: sqlite3.Connection, webhook: str) -> list[dict]:
+    """Send pending alerts in order, stopping at the first failure so it is retried next round."""
+    sent = []
+    for event in pending_alerts(connection):
+        body = payload(event)
+        error = send_webhook(webhook, body)
+        if error is not None:
+            print(f"Alert not delivered ({error}); retrying next round.", file=sys.stderr, flush=True)
+            break
+        record(connection, [event], "sent")
+        print(f"Alert sent: {body['text']}", file=sys.stderr, flush=True)
+        sent.append(body)
+    return sent
+
+
+def list_alerts(connection: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    """Return recorded alerts, newest first."""
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise ValueError("Alert limit must be between 1 and 1000.")
+    return [dict(row) for row in connection.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,))]

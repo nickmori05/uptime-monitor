@@ -3,4 +3,5 @@
 !monitor.py
 !incidents.py
 !api.py
+!alerts.py
 !dashboard.html
