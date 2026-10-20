@@ -2,8 +2,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 import json
-import re
 from pathlib import Path
+import re
 import selectors
 import signal
 import subprocess
@@ -78,8 +78,11 @@ class WatchTests(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_removing_last_target_stops_next_cycle(self):
+        def remove(seconds):
+            monitor.remove_target(self.connection, "api")
+
         with patch.object(monitor, "probe", return_value=self.result()), \
-                patch.object(monitor, "sleep", side_effect=lambda seconds: monitor.remove_target(self.connection, "api")):
+                patch.object(monitor, "sleep", side_effect=remove):
             batches = list(monitor.watch_targets(self.connection))
         self.assertEqual(len(batches), 2)
         self.assertEqual(batches[-1], {"cycle": 2, "results": []})
@@ -131,7 +134,8 @@ class WatchTests(unittest.TestCase):
         with redirect_stderr(StringIO()), patch.object(monitor, "probe") as probe:
             self.assertEqual(monitor.main(["--database", str(self.database), "watch", "--interval", "nan"]), 2)
             probe.assert_not_called()
-        with redirect_stderr(StringIO()), patch.object(monitor, "run_targets", side_effect=monitor.sqlite3.OperationalError("locked")):
+        locked = monitor.sqlite3.OperationalError("locked")
+        with redirect_stderr(StringIO()), patch.object(monitor, "run_targets", side_effect=locked):
             self.assertEqual(monitor.main(["--database", str(self.database), "watch"]), 2)
 
     def test_interrupt_between_batches_keeps_saved_results(self):
@@ -195,3 +199,7 @@ class WatchProcessTests(unittest.TestCase):
                         self.assertEqual(len(monitor.history(connection)), 1)
                     finally:
                         connection.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

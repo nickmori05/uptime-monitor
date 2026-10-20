@@ -1,3 +1,5 @@
+"""HTTP fixture for the Docker smoke test: a flaky service, a slow endpoint, and a webhook receiver."""
+
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import time

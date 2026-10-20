@@ -1,0 +1,18 @@
+[project]
+name = "uptime-monitor"
+version = "0.1.0"
+description = "Check HTTP endpoints, keep their history in SQLite, and report incidents."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["alerts", "api", "incidents", "monitor"]

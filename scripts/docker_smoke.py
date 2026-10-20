@@ -1,10 +1,11 @@
+"""Build the image and check the watcher, alerts, API, and dashboard end to end with Docker Compose."""
+
 import json
 import os
 from pathlib import Path
 import subprocess
 import time
 from uuid import uuid4
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -74,7 +75,8 @@ def main():
             time.sleep(0.2)
         run(["stop", "--timeout", "5", "monitor"])
         container = run(["ps", "--all", "--quiet", "monitor"]).strip()
-        inspected = subprocess.run(["docker", "inspect", container], text=True, capture_output=True, check=True, timeout=30)
+        inspected = subprocess.run(["docker", "inspect", container], text=True, capture_output=True,
+                                   check=True, timeout=30)
         state = json.loads(inspected.stdout)[0]["State"]
         assert state["ExitCode"] == 143 and not state["Running"], state
         assert len(json.loads(command("history"))) == 6
@@ -82,7 +84,8 @@ def main():
         print("SIGTERM shutdown and saved history passed.", flush=True)
 
         # The fixture serves one request at a time, so this runs after the watcher checks.
-        slow = json.loads(command("check", "http://fixture:8000/slow", "--timeout", "10", "--deadline", "1", expected=1))
+        slow = json.loads(command("check", "http://fixture:8000/slow", "--timeout", "10", "--deadline", "1",
+                                  expected=1))
         assert slow["error"] == "deadline_exceeded" and slow["latency_ms"] < 3000, slow
         print("Request deadline passed.", flush=True)
 

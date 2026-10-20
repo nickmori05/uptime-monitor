@@ -1,12 +1,12 @@
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
 import tempfile
 import unittest
 
-import monitor
 from incidents import list_incidents
+import monitor
 
 
 class IncidentTests(unittest.TestCase):
@@ -115,3 +115,7 @@ class IncidentTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())[0]["state"], "open")
         with redirect_stderr(StringIO()):
             self.assertEqual(monitor.main(["--database", str(self.database), "incidents", "--failures", "0"]), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

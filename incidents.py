@@ -1,3 +1,5 @@
+"""Rebuild incidents (runs of consecutive failures) from saved observations."""
+
 from contextlib import closing
 from heapq import nlargest
 import sqlite3
@@ -12,6 +14,7 @@ def list_incidents(
     failures: int = 2,
     recoveries: int = 2,
 ) -> list[dict]:
+    """Return incidents newest first, optionally filtered by URL and state."""
     for name, value, maximum in (
         ("Limit", limit, 1000), ("Failures", failures, 100), ("Recoveries", recoveries, 100)
     ):

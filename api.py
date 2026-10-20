@@ -1,3 +1,5 @@
+"""Read-only HTTP API and dashboard for saved results."""
+
 import base64
 from contextlib import closing
 import hashlib
@@ -15,6 +17,8 @@ DASHBOARD = Path(__file__).resolve().with_name("dashboard.html")
 
 
 class Query:
+    """Parse a query string, rejecting unknown or repeated parameters."""
+
     def __init__(self, raw: str, allowed: tuple[str, ...]):
         try:
             values = parse_qs(raw, keep_blank_values=True, strict_parsing=bool(raw))
@@ -42,6 +46,7 @@ class Query:
 
 def routes(store) -> dict:
     # `store` is the monitor module, passed in so this file doesn't import it back.
+    """Map each API path to its allowed parameters and handler."""
     def summary(connection, query):
         url, target = query.text("url"), query.text("target")
         if url is not None and target is not None:
@@ -69,6 +74,7 @@ def routes(store) -> dict:
 
 def read_only(database: Path) -> sqlite3.Connection:
     # Opening read-only guarantees a request can never change saved history.
+    """Open the database so that no request can change it."""
     connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     return connection
@@ -76,6 +82,7 @@ def read_only(database: Path) -> sqlite3.Connection:
 
 def dashboard_headers(page: str) -> dict:
     # Only the page's own inline script and style may run, and it may only call this server.
+    """Build security headers that allow only the page's own inline script and style."""
     def hashes(tag):
         return " ".join(
             "'sha256-" + base64.b64encode(hashlib.sha256(body.encode()).digest()).decode() + "'"
@@ -87,6 +94,7 @@ def dashboard_headers(page: str) -> dict:
 
 
 def make_server(database: Path, host: str, port: int, store) -> ThreadingHTTPServer:
+    """Create (but don't start) the HTTP server for the API and dashboard."""
     table = routes(store)
     # Read once on startup so a missing page fails `serve` instead of every request.
     page = DASHBOARD.read_text(encoding="utf-8")

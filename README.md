@@ -2,11 +2,14 @@
 
 [![Tests](https://github.com/nickmori05/uptime-monitor/actions/workflows/tests.yml/badge.svg)](https://github.com/nickmori05/uptime-monitor/actions/workflows/tests.yml)
 
-Check an HTTP endpoint, record its response time, and inspect its history.
-The first version is a local Python command-line tool with SQLite storage and
-no external package dependencies.
+A small HTTP uptime monitor written in standard-library Python. It checks
+endpoints once or on an interval, stores every observation in SQLite, rebuilds
+incidents and summaries from that history, sends a webhook once per incident
+change, and serves the results through a read-only JSON API and dashboard. It
+runs from a clone with no packages to install, or as a hardened Docker Compose
+service.
 
-## Run
+## Quick start
 
 Requires Python 3.10 or later.
 
@@ -14,464 +17,231 @@ Requires Python 3.10 or later.
 git clone https://github.com/nickmori05/uptime-monitor.git
 cd uptime-monitor
 python3 monitor.py check https://example.com
-python3 monitor.py history --limit 5
+python3 monitor.py add example https://example.com --timeout 3
+python3 monitor.py watch --interval 5 --count 2
+python3 monitor.py summary
+python3 monitor.py serve
 ```
 
-Each check prints JSON with its UTC timestamp, HTTP status, response time in
-milliseconds, and `up` or `down` state. HTTP 200–299 is `up`. Other HTTP statuses,
-connection failures, and timeouts are `down`. Redirects are recorded without
-following them, so checking a redirecting URL records that endpoint's response.
+Then open <http://127.0.0.1:8080/> for the dashboard and press Ctrl+C to stop
+`serve`. Results are saved in `.local/checks.sqlite3` next to `monitor.py`;
+pass `--database PATH` before the command to use another file.
 
-Checks use GET and stop after receiving response headers. They do not verify
-response-body content or the health of dependencies behind the endpoint.
+## Usage
 
-Exit codes: `0` for an up endpoint, `1` for a recorded down endpoint, `2` for
-invalid input or a local storage error, and `130` for cancellation. Failed checks
-are retained in history.
+Every command prints JSON. Run `python3 monitor.py COMMAND --help` for all
+options.
 
-```sh
-python3 monitor.py check https://example.com --timeout 3
-```
+| Command | What it does |
+| --- | --- |
+| `check URL` | Check a URL once and save the result. |
+| `add`, `update`, `remove`, `targets` | Manage named targets with saved settings. |
+| `run NAME`, `run-all` | Check one or every saved target once. |
+| `watch` | Check every saved target in repeated rounds, optionally sending alerts. |
+| `history`, `summary`, `incidents`, `alerts` | Report on saved results without making requests. |
+| `serve` | Serve the read-only JSON API and dashboard. |
 
-`--timeout` sets the socket timeout, from greater than 0 to at most 60 seconds.
-It is not a guaranteed deadline for the whole operation: DNS resolution and
-multiple network steps may take additional time.
-
-To cap the whole check, add `--deadline`:
+### Checks
 
 ```sh
 python3 monitor.py check https://example.com --timeout 3 --deadline 10
+python3 monitor.py history --limit 5
 ```
 
-The deadline covers DNS resolution, connecting, and waiting for response
-headers. It accepts greater than 0 to at most 60 seconds. If it passes first,
-the check is saved as `down` with error `deadline_exceeded` and no status code,
-and the command exits `1`. A deadline shorter than the socket timeout simply
-takes over; a longer one only catches steps the socket timeout doesn't bound.
-The abandoned request keeps running in the background until its own socket
-timeout or DNS lookup finishes, but the result is not waited for or saved.
-Without `--deadline`, checks behave as before.
+A check sends one GET, stops after the response headers, and records the UTC
+time, status code, latency in milliseconds, and `up` or `down`. Only `2xx` is
+`up`; other statuses, connection errors, and timeouts are `down`. Redirects are
+recorded, not followed. Response bodies and downstream dependencies are not
+checked.
 
-## Named targets
+`--timeout` (default 5) is the socket timeout. It doesn't bound DNS lookups or
+the whole request, so `--deadline` adds a limit on DNS, connecting, and waiting
+for headers. A check that passes its deadline is saved as `down` with the error
+`deadline_exceeded`. Both accept more than 0 and at most 60 seconds.
 
-Save an endpoint and its timeout once, then run checks by name:
+Exit codes are shared by all commands: `0` success (or an `up` check), `1` a
+`down` check, `2` invalid input or a storage error, `130` Ctrl+C, and `143`
+SIGTERM.
 
-```sh
-python3 monitor.py add example https://example.com --timeout 3
-python3 monitor.py targets
-python3 monitor.py run example
-python3 monitor.py history --url https://example.com --limit 5
-```
-
-`add` saves configuration without sending a request. `run` makes one check,
-persists the result, and uses the same exit codes as `check`. Names are case
-sensitive and contain 1–64 ASCII letters, digits, underscores, or hyphens;
-the first character must be a letter or digit. Duplicate names are rejected
-without changing the existing configuration. History filtering matches the
-exact saved URL, including its path and query string.
-
-To bound every run of a target, save a default deadline with it:
+### Targets
 
 ```sh
 python3 monitor.py add example https://example.com --timeout 3 --deadline 10
-python3 monitor.py run example
-python3 monitor.py run example --deadline 5
-```
-
-The saved deadline accepts the same range as `check --deadline` and is used by
-`run`, `run-all`, and `watch`. A `--deadline` given on the command line replaces
-it for that run only and is not saved; in `run-all` and `watch` it applies to
-every target, including those with their own deadline. Targets without a saved
-deadline keep the socket-timeout-only behavior. `targets` lists the saved
-`deadline`, or `null` when there is none. Databases created by earlier versions
-gain the empty column automatically the next time they are opened.
-
-Change an existing target without removing it:
-
-```sh
-python3 monitor.py update example --timeout 2
-python3 monitor.py update example --url https://example.com/health --timeout 3
-python3 monitor.py update example --deadline 8
+python3 monitor.py update example --url https://example.com/health
 python3 monitor.py update example --no-deadline
-```
-
-Supply any of `--url`, `--timeout`, and `--deadline`, or `--no-deadline` to
-clear a saved deadline. Omitted settings stay unchanged. Updates
-print the saved settings as JSON without making a request. Invalid values or
-missing names return exit code `2` and leave the configuration unchanged.
-Past checks and incidents remain tied to their original URL. A running watcher
-loads the updated settings on its next round; a batch already in progress keeps
-its original settings.
-
-Remove a target you no longer want to check:
-
-```sh
+python3 monitor.py run example
+python3 monitor.py targets
 python3 monitor.py remove example
 ```
 
-`remove` deletes only the saved configuration and prints `{"removed": "example"}`.
-Past checks remain in history. Missing names return exit code `2`. A batch that
-already loaded its targets may still finish checking a removed target.
+A target saves a URL, a timeout, and an optional default deadline under a name
+(1–64 letters, digits, `-` or `_`, starting with a letter or digit). `add` and
+`update` never make a request. Removing or re-pointing a target keeps its past
+checks, which stay tied to the URL they were made against. A `--deadline` given
+to `run`, `run-all`, or `watch` overrides saved deadlines for that run only.
 
-## Check all saved targets
-
-```sh
-python3 monitor.py add example-home https://example.com --timeout 3
-python3 monitor.py add example-missing https://example.com/missing --timeout 3
-python3 monitor.py run-all --workers 2
-```
-
-`run-all` checks each saved target once. It starts at most `--workers` requests
-at a time (default 4, maximum 32), using each target's stored timeout. Database
-writes happen on the calling thread and each finished observation is committed
-separately. Output is a JSON array sorted by target name; each entry includes
-the target name and the saved observation ID.
-
-Targets with a saved deadline use it. `run-all --deadline 10` instead applies
-the same whole-request limit to every target in the batch. A request that passes its deadline is saved as `deadline_exceeded`
-without holding up the others, and its worker slot is freed even if the
-abandoned lookup is still running.
-
-The command returns `0` if all targets are up or no targets exist, `1` if any
-target is down, and `2` for invalid configuration or storage errors. A down
-endpoint does not prevent the other results from being saved. Configuration is
-validated before any batch requests start.
-
-On Ctrl+C, queued requests are cancelled and the command returns `130` after
-active requests finish. Already committed observations remain in history.
-Without `--deadline`, the socket timeout is not a whole-operation deadline, so
-an active DNS lookup or request may delay shutdown. With one, shutdown waits at
-most about that long for active requests. Saved per-target deadlines bound
-their own requests the same way.
-
-## Keep watching
+### Batches and the watcher
 
 ```sh
-python3 monitor.py watch --interval 30 --workers 4
-python3 monitor.py watch --interval 5 --count 4
+python3 monitor.py run-all --workers 4
 python3 monitor.py watch --interval 30 --deadline 15
 ```
 
-`watch` repeats batches in the foreground. It waits `--interval` seconds after
-one batch finishes before starting the next; batches never overlap within one
-watcher. The interval must be 1–86,400 seconds. Omit `--count` to keep running,
-or set a positive number of batches. An empty target list produces one empty
-batch and exits. Run one watcher per database to avoid duplicate checks.
+`run-all` checks every saved target once, at most `--workers` (1–32) at a time,
+and prints the results sorted by target name. It exits `1` if any target is down.
+Each result is committed as soon as it arrives, so a failure or Ctrl+C keeps
+everything already saved.
 
-Each round reloads the saved targets, so another terminal can add, remove, or
-update them, including their saved deadlines, without restarting the watcher. Each completed batch is flushed as one JSON line
-with `cycle` and `results` fields. Observations are saved as requests finish,
-before the batch output appears. A finite run exits `1` if any round observed a
-failure, even if later rounds recover; otherwise it exits `0`.
+`watch` repeats `run-all`, waiting `--interval` seconds (1–86,400) after each
+round, and prints one JSON line per round. It reloads targets every round, so
+other terminals can add, update, or remove them while it runs. `--count N`
+stops after N rounds, and the exit code is `1` if any round saw a failure. It
+stops when no targets remain. Run one watcher per database.
 
-Ctrl+C exits `130`; SIGTERM exits `143`. While waiting between rounds, shutdown
-is immediate. During a batch, queued requests are cancelled and shutdown waits
-for active requests. Already committed observations survive. `--deadline` and saved
-target deadlines work as they do for `run-all`, on every round; without it, the socket timeout
-limitations above also apply here. Storage or configuration errors stop the
-watcher with exit code `2`.
-
-## Incident reports
+### Incidents and summaries
 
 ```sh
-python3 monitor.py incidents
-python3 monitor.py incidents --state open --url https://example.com
+python3 monitor.py incidents --state open
 python3 monitor.py incidents --failures 3 --recoveries 2 --limit 10
-```
-
-By default, two consecutive failed observations open an incident and two
-consecutive successful observations resolve it. One success followed by another
-failure keeps the same incident open. `opened_at` is the first failure;
-`confirmed_at` is the failure that reaches the threshold. `resolved_at` is the
-success that confirms recovery. The report includes the matching check IDs.
-
-Reports are reconstructed from saved checks in insertion order, grouped by exact
-URL. Checks from every command and target alias count. Changing the thresholds
-reinterprets that history; it does not edit records. Results are newest incident
-first, with URL and state filters applied before the limit (maximum 1,000).
-Thresholds must be between 1 and 100. Reporting succeeds with exit code `0`, even
-when incidents are open.
-
-An open incident means recovery has not been confirmed in the saved history.
-It does not prove an endpoint is still down: check `last_checked_at`, especially
-if a target was removed. Gaps between checks are unknown. Reports scan all
-matching observations, so they are intended for local-sized histories. This is
-not an alerting system or a measurement of exact outage duration.
-
-## Alerts
-
-Send a webhook when an incident opens or resolves:
-
-```sh
-python3 monitor.py watch --interval 30 --alert-webhook https://hooks.example.com/uptime
-python3 monitor.py alerts --limit 10
-```
-
-After each batch, `watch --alert-webhook` rebuilds incidents with the default
-thresholds (two failures open one, two successes resolve it) and POSTs one JSON
-object per new event: `{"event": "opened" | "resolved", "url": ..., "text": ...,
-"incident": {...}}`. `incident` matches the `incidents` report, and `text` is a
-one-line summary. Events are sent oldest first, and any `2xx` response counts as
-delivered. Redirects are not followed.
-
-Each event is sent once. Sent events are saved in the database, so restarting
-the watcher doesn't repeat them, and flapping or further failures inside an open
-incident don't send more. Several target names for one URL share its alerts.
-If delivery fails (an error status, a connection error, or no answer within
-about 10 seconds), the reason goes to stderr and that event and the ones after
-it are retried after the next batch. Checks keep running while the webhook is down.
-
-When the watcher starts with `--alert-webhook`, incident events already in the
-history are recorded as `skipped` instead of sent, and the count is printed to
-stderr. So enabling alerts on an existing database doesn't replay old incidents,
-but an incident that opened while no alerting watcher was running is not sent
-either; use `incidents --state open` to review those. `alerts` lists sent and
-skipped events, newest first (default 20, maximum 1,000). Databases from earlier
-versions gain the empty alert table automatically.
-
-The webhook URL may carry a token in its path or query, but not a username or
-password. It is not saved, and delivery messages never include it. There is no
-retry backoff, no per-target thresholds, and no built-in format for a particular
-chat service beyond the `text` field.
-
-## Check summaries
-
-After leaving the watcher running, use `summary` to see how each endpoint did:
-
-```sh
-python3 monitor.py summary
-python3 monitor.py summary --url https://example.com --last 50
+python3 monitor.py summary --target example --last 50
 python3 monitor.py summary --state down
 ```
 
-For a saved target, use `python3 monitor.py summary --target example`. It uses
-that name's current URL and can be combined with `--state` and `--last`.
-Choose either `--target` or `--url`; a missing target exits `2`. After changing
-a target's URL, use `--url` to inspect checks recorded for the old address.
+An incident opens after `--failures` consecutive failed checks of the same URL
+(default 2) and resolves after `--recoveries` consecutive successes (default 2).
+With the defaults, one success between failures keeps it open. Reports are
+rebuilt from saved checks in insertion order every time, so changing the
+thresholds reinterprets history without editing it.
 
-The default sample is the last 100 saved checks **per URL**. `--last` accepts
-1–10,000. Results include total stored checks, sampled checks, up/down counts,
-the latest result, and average/minimum/maximum latency for successful checks.
-Timeouts and other failures count as down but aren't mixed into those latency
-figures. If every sampled check failed, the latency fields are `null`.
+`summary` reports, per URL, the latest result and the up/down counts and
+latency (successful checks only) over the last `--last` checks (default 100).
+`--state` filters by each URL's latest result. Both commands describe what was
+observed, not live health or an uptime percentage; gaps between checks are
+unknown.
 
-`--state up` or `--state down` filters endpoints by their latest saved result.
-It keeps both successful and failed checks in each endpoint's sample. Use it
-with `--url` and `--last` as needed. No matches returns `[]`; this describes the
-last observation, not the endpoint's live state.
-
-URLs are matched exactly and returned alphabetically. Two target names pointing
-to the same URL share one summary. Removing a target keeps its saved results.
-An empty database or unmatched URL returns `[]`. The command makes no requests
-and exits `0` even when the saved results include failures.
-
-The sample uses insertion order, so a clock change won't reorder checks. These
-are observed results, not an uptime percentage or a claim that an endpoint is
-healthy now. There may be long gaps between checks. A large stored history can
-take time to summarize; the sample limit bounds the report's input per endpoint,
-but the query still examines matching history to rank and count it.
-
-## Read-only API
-
-Serve saved targets and results as JSON over HTTP:
+### Alerts
 
 ```sh
-python3 monitor.py serve
+python3 monitor.py watch --interval 30 --alert-webhook https://hooks.example.com/uptime
+python3 monitor.py alerts
+```
+
+With `--alert-webhook`, the watcher POSTs one JSON object after each round for
+every new incident event, using the default thresholds:
+
+```json
+{"event": "opened", "url": "https://example.com", "text": "Incident opened for ...", "incident": {"...": "..."}}
+```
+
+`event` is `opened` or `resolved`, and `incident` matches the `incidents`
+report. Each event is sent once: sent events are saved in the database, so
+restarts, flapping, and further failures don't repeat them, and several targets
+for one URL share alerts. A delivery that fails (non-`2xx`, redirect, connection
+error, or no answer within about 10 seconds) is logged to stderr and retried
+after the next round, in order. Events that were already in the history when
+the watcher started are recorded as `skipped` instead of sent. `alerts` lists
+sent and skipped events, newest first.
+
+### API and dashboard
+
+```sh
+python3 monitor.py serve --port 8080
 curl http://127.0.0.1:8080/api/summary
 curl 'http://127.0.0.1:8080/api/history?limit=5&url=https%3A%2F%2Fexample.com'
 ```
 
-`serve` listens on `127.0.0.1:8080` by default; change it with `--host` and
-`--port` (`--port 0` picks a free port). The address is printed to stderr.
-Four GET endpoints mirror the commands and accept the same filters as query
-parameters:
+`serve` listens on `127.0.0.1:8080` (`--port 0` picks a free port). It answers
+GET requests for `/api/targets`, `/api/history`, `/api/summary`, and
+`/api/incidents`, which return the same JSON as the matching commands and accept
+their filters as query parameters (URLs must be percent-encoded). Invalid or
+unknown parameters return `400`, unknown paths `404`, and other methods `405`.
 
-- `/api/targets`: saved targets, like `targets`.
-- `/api/history`: `limit` and `url`, like `history`.
-- `/api/summary`: `url` or `target`, `last`, and `state`, like `summary`.
-- `/api/incidents`: `url`, `state`, `limit`, `failures`, and `recoveries`, like `incidents`.
+`/` serves `dashboard.html`: a single static page that lists each target's
+latest result, recent up/down counts, average latency, and open incidents, and
+refreshes every 30 seconds. It has no external resources, inserts saved values
+only as text, and is served with a strict Content Security Policy.
 
-Responses use the same JSON as the commands. Invalid, unknown, or repeated
-parameters return `400` with an `{"error": ...}` body, unknown paths return `404`,
-and other methods return `405`. If the database can't be read, the response is
-`500` and the details go to stderr. URL values must be percent-encoded; an
-unencoded `+` or `&` in a filter URL changes its meaning.
+There is no authentication or TLS. Keep the loopback default unless the network
+is trusted, because anyone who can reach the port can read every saved URL.
 
-The API never makes requests or changes data. Each request opens the database
-read-only, so it can run beside a watcher on the same file. On startup, `serve`
-creates or upgrades the database once, like other commands. Ctrl+C exits `130`
-and SIGTERM exits `143`; a port that's already in use exits `2`.
-
-There is no authentication or TLS. Keep the default loopback address unless the
-network is trusted: anyone who can reach the port can read every saved URL and
-result. The Compose file does not publish a port for it.
-
-## Dashboard
-
-`serve` also answers `/` with a small dashboard page. Open
-<http://127.0.0.1:8080/> in a browser while it runs:
-
-```sh
-python3 monitor.py serve
-```
-
-The page lists every saved target and checked URL with its target names, latest
-result, last check time, up checks out of the sampled checks, and average
-latency of successful checks. A second table lists open incidents. It reads
-`/api/targets`, `/api/summary`, and `/api/incidents?state=open&limit=100`
-with the default sample size and thresholds, and refreshes every 30 seconds. Targets
-that haven't been checked yet show as `not checked yet`. If a refresh fails, the
-page shows the error and keeps the last results it loaded.
-
-The page is one static file, `dashboard.html`, read once when `serve` starts; if
-it's missing, `serve` exits `2`. It has no build step, external scripts, fonts,
-or images. Saved URLs and errors are only inserted as text, and a Content
-Security Policy lets just the page's own inline script and style run and only
-call back to the same server. `/` accepts no query parameters (`400`), and
-other paths keep their JSON `404`.
-
-Like the API, the dashboard is read-only and unauthenticated, so the same
-loopback advice applies. It shows saved observations, not live health; times are
-shown in the browser's time zone. There are no charts, per-URL history views, or
-controls for changing targets.
-
-## Docker
+### Docker
 
 ```sh
 docker compose build
 docker compose run --rm monitor add example https://example.com --timeout 3
 docker compose up -d monitor
 docker compose logs -f monitor
-```
-
-The service checks saved targets every 30 seconds after each batch finishes,
-giving each request at most 20 seconds with `--deadline 20`. That flag
-overrides any deadline saved with a target, so the stop grace period below
-always holds.
-It runs as a non-root user with a read-only filesystem, except for `/data` and
-`/tmp`. The named `monitor-data` volume stores the database. Container recreation
-and `docker compose down` preserve it. `docker compose down --volumes` deletes it.
-The container database is separate from the default local Python database.
-
-Use another container to inspect or change the same stored data:
-
-```sh
-docker compose run --rm monitor history --limit 10
 docker compose run --rm monitor incidents --state open
-docker compose run --rm monitor remove example
-docker compose stop monitor
 ```
 
-To send alerts from the container, add `--alert-webhook URL` to the `command`
-in `compose.yml`; the Compose network must be able to reach the webhook.
+The `monitor` service runs `watch --interval 30 --deadline 20` as a non-root
+user with a read-only filesystem, no capabilities, and no published ports. The
+database lives in the `monitor-data` volume, which survives `docker compose
+down` but not `down --volumes`. Add targets before starting it; the watcher exits
+when none remain. Compose allows 75 seconds for SIGTERM shutdown, which the
+20-second deadline stays well inside. Inside the container, `localhost` is the
+container itself. To send alerts, add `--alert-webhook URL` to the service
+`command` in `compose.yml`.
 
-Add at least one target before starting the watcher. It exits when no targets
-remain and does not automatically restart; after adding new targets, run
-`docker compose up -d monitor` again. No inbound ports are published. Inside the
-container, `localhost` refers to the container, so target URLs must be reachable
-from its network.
+## Design
 
-Compose sends SIGTERM and allows 75 seconds before forcing shutdown. The 20
-second deadline keeps active requests well inside that grace period, even when a
-DNS lookup hangs. Committed checks remain in the volume.
+- `monitor.py`: the command line, request probing, SQLite storage, targets,
+  batches, and the watcher.
+- `incidents.py`: rebuilds incidents from saved checks.
+- `alerts.py`: finds unsent incident events and delivers them to a webhook.
+- `api.py` and `dashboard.html`: the read-only HTTP API and the static dashboard.
 
-Run the container integration check with Docker and Compose available:
+All state lives in one SQLite file with three tables: `checks` (one row per
+observation), `targets`, and `alerts` (one row per sent or skipped incident
+event, unique per event). Incidents and summaries are derived from `checks` on
+demand rather than stored, and checks are ordered by row ID rather than by
+timestamp, so a clock change can't reorder history. `connect` creates missing
+tables and columns, so databases from earlier versions upgrade in place.
 
-```sh
-python3 scripts/docker_smoke.py
-```
+Requests run on worker threads while the calling thread does every database
+write, which keeps SQLite on one connection. Deadlines (and webhook deliveries)
+run the request on a daemon thread that is abandoned when time runs out, since
+a hung DNS lookup can't be cancelled; the abandoned thread finishes on its own
+socket timeout. The API opens the database read-only for each request, so it
+can run beside a watcher on the same file.
 
-It builds an isolated image, uses a temporary Compose project and volume, and
-checks two failures followed by two recoveries against a fixture on an internal
-network. It also checks non-root execution, persistence across containers, and
-SIGTERM shutdown, that a slow response is cut off by `--deadline`, that the
-opening and resolution alerts reach a webhook once even after the watcher
-restarts, and that the API and dashboard serve the watcher's history from
-another container. Its temporary containers, network, volume, and image are
-removed afterward; your regular monitor volume is not used.
-
-## Storage
-
-Results are saved in `.local/checks.sqlite3` next to the script. The database is
-excluded from Git. History is returned in newest-record-first order. The default
-limit is 20 records; the maximum is 1,000.
-
-Choose a separate database for experiments:
-
-```sh
-python3 monitor.py --database .local/demo.sqlite3 check https://example.com
-python3 monitor.py --database .local/demo.sqlite3 history
-```
-
-## Tests
+## Testing
 
 ```sh
 python3 -m unittest discover -s tests -v
+python3 scripts/docker_smoke.py
 ```
 
-The test suite uses a temporary local HTTP server and temporary databases.
-It checks HTTP success, server failure, redirects, timeouts, persistence,
-history ordering, request deadlines, input validation, and command-line exit codes. Connection
-failures and hung lookups are injected so they don't depend on external networking.
-Target tests cover persisted settings, duplicate names, invalid configuration,
-configured timeouts, failed checks, URL-filtered history, and target removal
-without losing past checks. Saved-deadline tests cover persistence, setting and
-clearing deadlines, rejected values, upgrading older databases, and how saved
-and command-line deadlines combine in `run`, `run-all`, and the watcher.
-Batch tests verify overlapping requests, the worker limit, writes on the calling
-thread, mixed results, deadlines that don't hold up other targets, and CLI exit codes. Concurrency is checked with a barrier
-rather than by comparing wall-clock timings.
+The unit tests use a temporary local HTTP server and temporary databases, with
+connection failures and hung lookups injected, so they need no network access.
+They cover checks and deadlines, targets, batches and their concurrency limit,
+the watcher and its signal handling, incidents, summaries, alerts and webhook
+delivery, the API, the dashboard's headers and policy, and upgrading older
+databases.
 
-Watch tests cover target reloads, wait placement, streamed output, saved results
-after interruption, and real process shutdown using SIGINT and SIGTERM. Incident
-tests cover independent streaks, recovery, filtering, persistence, and clock changes.
-Summary tests cover per-URL samples, successful-response latency, empty results,
-exact URL matching, clock changes, and reading history without making requests.
-API tests compare every endpoint with its command, cover filters, invalid and
-unknown parameters, unknown paths and write methods, storage errors, read-only
-database access, port errors, upgrading an older database, and signal shutdown.
-Dashboard tests cover the served page and its headers, that the security policy
-matches the page's inline script and style, that every API path the page reads
-is answered, that saved values are only inserted as text, rejected queries and
-methods, and a missing page file.
-Alert tests cover one webhook per opening and resolution, no repeats for flapping
-or restarts, skipped backlogs, retrying failed deliveries in order, upgrading an
-older database, and real deliveries to a local receiver that answers with
-success, errors, redirects, or too slowly.
+`scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
+and project, then checks failure and recovery against a fixture on an internal
+network: non-root execution, persistence across containers, SIGTERM shutdown,
+deadlines, webhook alerts sent once across restarts, and the API and dashboard
+served from another container. Everything it creates is removed afterward.
 
-GitHub Actions runs the suite on Python 3.10 and 3.14 and the Docker integration check.
+GitHub Actions runs `ruff check`, the unit tests on Python 3.10 and 3.14, and
+the Docker smoke test. Lint settings are in `pyproject.toml`.
 
-## Structure
+## Limitations
 
-- `probe`: make one request, optionally within a total deadline, and classify the observation.
-- `save` and `history`: persist and retrieve observations using SQLite.
-- `summarize`: group recent saved observations by URL for a quick health report.
-- `add_target`, `get_target`, `list_targets`, `update_target`, and `remove_target`: manage reusable check settings.
-- `run_targets`: run requests concurrently and save completed checks on the caller's connection.
-- `watch_targets`: repeat batches with a delay and fresh settings each round.
-- `list_incidents`: derive failure and recovery episodes from saved observations.
-- `alerts.deliver`: send each new incident opening or resolution to a webhook once.
-- `serve` and `api.make_server`: answer read-only JSON requests from saved data.
-- `dashboard.html`: the static page `serve` returns at `/`, built on the JSON API.
-- `main`: parse commands, print JSON, and return exit codes.
+- Every report and alert round rescans the matching history, so it suits
+  local-sized databases rather than long-term storage at scale.
+- Observations are point-in-time samples; there are no uptime percentages or
+  exact outage durations.
+- The socket timeout alone doesn't bound DNS lookups; use a deadline for that.
+- Alerts use the default incident thresholds and have no backoff. Incidents that
+  opened while no alerting watcher was running are skipped, not sent.
+- The API and dashboard have no authentication, TLS, or write access.
 
-SQLite keeps the initial local workflow reproducible. A future shared service
-would require an explicit concurrency, access, and network-boundary design.
+## Roadmap
 
-## Development direction
-
-The current release runs individual checks, batches, and a foreground watcher,
-derives incident reports from their history, and serves them through a local
-read-only API and dashboard, and can send deduplicated webhook alerts. It has no
-authenticated hosted API and does not calculate uptime percentages from sparse
-observations.
-
-Next milestones:
-
-1. ~~Add an API and a small dashboard for viewing results.~~ Done: `serve`
-   provides the read-only JSON API and a dashboard at `/`.
+1. ~~Add an API and a small dashboard for viewing results.~~ Done: `serve`.
 2. Add alert deduplication and measured reliability tests. Alert deduplication
-   is done: `watch --alert-webhook` sends each incident change once. Measured
-   reliability tests remain.
-3. ~~Consider saving a default deadline with each target.~~ Done: `add` and
-   `update` accept `--deadline`, and runs use it unless overridden.
+   is done (`watch --alert-webhook`); measured reliability tests remain.
+3. ~~Save a default deadline with each target.~~ Done: `add --deadline`.

@@ -71,8 +71,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([row["url"] for row in rows], ["https://example.com/search?q=a+b&page=2"])
         _, rows, _ = self.get("/api/summary?state=up")
         self.assertEqual([row["url"] for row in rows], ["https://other.example"])
-        _, rows, _ = self.get("/api/incidents?failures=1&state=open&url=https%3A%2F%2Fexample.com%2Fsearch%3Fq%3Da%2Bb%26page%3D2")
-        self.assertEqual([(row["url"], row["state"]) for row in rows], [("https://example.com/search?q=a+b&page=2", "open")])
+        encoded = "https%3A%2F%2Fexample.com%2Fsearch%3Fq%3Da%2Bb%26page%3D2"
+        _, rows, _ = self.get(f"/api/incidents?failures=1&state=open&url={encoded}")
+        self.assertEqual([(row["url"], row["state"]) for row in rows],
+                         [("https://example.com/search?q=a+b&page=2", "open")])
 
     def test_empty_database_returns_empty_lists(self):
         for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents"):

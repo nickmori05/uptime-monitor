@@ -163,5 +163,5 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

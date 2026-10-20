@@ -1,3 +1,5 @@
+"""Send each incident opening and resolution to a webhook exactly once."""
+
 from datetime import datetime, timezone
 import http.client
 import json
@@ -14,6 +16,8 @@ WEBHOOK_DEADLINE = 10.0
 
 
 class NoRedirects(HTTPRedirectHandler):
+    """Report redirects as failed deliveries instead of following them."""
+
     def redirect_request(self, request, response, code, message, headers, new_url):
         return None
 
@@ -37,6 +41,7 @@ def pending_alerts(connection: sqlite3.Connection) -> list[dict]:
 
 
 def record(connection: sqlite3.Connection, events: list[dict], status: str) -> None:
+    """Save events as sent or skipped. Events that are already saved are left alone."""
     recorded_at = datetime.now(timezone.utc).isoformat()
     with connection:
         connection.executemany(
@@ -55,6 +60,7 @@ def skip_backlog(connection: sqlite3.Connection) -> int:
 
 
 def payload(event: dict) -> dict:
+    """Build the JSON body sent to the webhook for one event."""
     incident = event["incident"]
     if event["event"] == "opened":
         text = f"Incident opened for {incident['url']}: failing since {incident['opened_at']}."
@@ -64,6 +70,7 @@ def payload(event: dict) -> dict:
 
 
 def post(webhook: str, body: dict, timeout: float) -> str | None:
+    """Send one POST and return None on a 2xx response, or a short error code."""
     request = Request(webhook, data=json.dumps(body).encode(), method="POST",
                       headers={"Content-Type": "application/json", "User-Agent": "uptime-monitor/0.1"})
     try:
