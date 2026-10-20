@@ -187,6 +187,14 @@ def connect(database: Path) -> sqlite3.Connection:
             UNIQUE(first_failure_id, event)
         )"""
     )
+    # A single row saved when alerting is first enabled; incident events after it are owed an alert.
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS alerting (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            enabled_at TEXT NOT NULL,
+            after_check_id INTEGER NOT NULL CHECK(after_check_id >= 0)
+        )"""
+    )
     connection.commit()
     return connection
 
@@ -438,6 +446,8 @@ def parser() -> argparse.ArgumentParser:
     watch.add_argument("--alert-webhook", type=url_argument, help="POST incident openings and resolutions to this URL")
     alert_log = commands.add_parser("alerts", help="Show sent and skipped alerts as JSON")
     alert_log.add_argument("--limit", type=int, default=20, help="Alerts to show, 1–1000 (default: 20)")
+    alert_log.add_argument("--pending", action="store_true",
+                           help="Show events the next alerting watcher will send instead, oldest first")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=url_argument, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"), help="Only report open or resolved incidents")
@@ -471,10 +481,7 @@ def main(argv: list[str] | None = None) -> int:
         with closing(connect(args.database)) as connection:
             if args.command == "watch":
                 if args.alert_webhook is not None:
-                    skipped = alerts.skip_backlog(connection)
-                    if skipped:
-                        print(f"Skipped {skipped} earlier incident event(s); alerting on new ones.",
-                              file=sys.stderr, flush=True)
+                    alerts.start(connection, args.alert_webhook)
                 failed = False
                 for batch in watch_targets(connection, interval=args.interval, count=args.count,
                                            workers=args.workers, deadline=args.deadline):
@@ -484,7 +491,7 @@ def main(argv: list[str] | None = None) -> int:
                         alerts.deliver(connection, args.alert_webhook)
                 return 1 if failed else 0
             if args.command == "alerts":
-                print(json.dumps(alerts.list_alerts(connection, args.limit), indent=2))
+                print(json.dumps(alerts.list_alerts(connection, args.limit, pending=args.pending), indent=2))
                 return 0
             if args.command == "incidents":
                 results = list_incidents(
