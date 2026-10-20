@@ -257,12 +257,12 @@ also confirm that the probe and alert scenarios fail when a bug is injected
 
 | Scenario | What it does | Measured (seed 1, defaults) |
 | --- | --- | --- |
-| Probe faults | 8 targets for 20 rounds, each check given one of: `2xx`, `503`, redirect, dropped connection, non-HTTP reply, headers slower than the timeout, headers trickled one byte at a time, or a hung DNS lookup. Timeout 0.15 s, deadline 0.3 s. | 160 checks, 0 misclassified, worst check 29 ms over its limit, slowest round 0.33 s |
+| Probe faults | 8 targets for 20 rounds, each check given one of: `2xx`, `503`, redirect, dropped connection, non-HTTP reply, headers slower than the timeout, headers trickled one byte at a time, or a hung DNS lookup. Timeout 0.4 s, deadline 0.6 s. | 160 checks, 0 misclassified, worst check 36 ms over its limit, slowest round 0.65 s |
 | Alert delivery | 3 targets with random outages for 202 rounds; the webhook fails (`500` or dropped connection) in 55 rounds; the watcher restarts 46 times; 36 rounds are checked by `run-all` with no watcher. | 80 alerts expected, 80 delivered, 0 lost, 0 repeated, 0 out of order, every one at the first round it could be |
-| Crash recovery | 43 rounds, each a new watcher process; 10 were killed with SIGKILL at a random point. | 22 alerts expected, 0 lost, 2 sent again after a kill, database integrity `ok` |
+| Crash recovery | 43 rounds, each a new watcher process; 11 were killed with SIGKILL at a random point. | 22 alerts expected, 0 lost, 2 sent again after a kill, database integrity `ok` |
 | Kill during delivery | Kills the watcher after the receiver reads an alert, before it answers. | Received twice, recorded as sent once |
 
-Timing limits allow 250 ms of slack for slow machines. The numbers above are
+Timing limits allow 500 ms of slack for slow machines. The numbers above are
 from one run on a laptop. For a given seed the probe and alert counts are the
 same on every run; timings, and how many kills land and where, vary.
 

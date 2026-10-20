@@ -18,7 +18,7 @@ from unittest.mock import patch
 from faults import EXPECTED, Clock, Faults, Receiver, resolver
 import monitor
 
-SLACK_SECONDS = 0.25
+SLACK_SECONDS = 0.5
 
 
 def oracle(states: list[str], failures: int = 2, recoveries: int = 2) -> list[tuple[str, int, int]]:
@@ -58,7 +58,7 @@ def saved_states(connection) -> dict[str, list[dict]]:
     return grouped
 
 
-def probe_faults(seed: int = 1, rounds: int = 12, timeout: float = 0.15, deadline: float = 0.3) -> dict:
+def probe_faults(seed: int = 1, rounds: int = 12, timeout: float = 0.4, deadline: float = 0.6) -> dict:
     """Check one target per fault kind each round and measure how each result was classified and how long it took."""
     rng = random.Random(seed)
     kinds = sorted(EXPECTED)

@@ -21,8 +21,8 @@ EXPECTED = {
     "trickle": ("down", "deadline_exceeded"),
     "dns": ("down", "deadline_exceeded"),
 }
-SLOW_SECONDS = 0.6
-TRICKLE_GAP = 0.04
+SLOW_SECONDS = 1.0
+TRICKLE_GAP = 0.025
 DNS_HANG_SECONDS = 2.0
 
 
