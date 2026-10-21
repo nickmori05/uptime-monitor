@@ -42,21 +42,57 @@ def pending_alerts(connection: sqlite3.Connection) -> list[dict]:
 
 def record(connection: sqlite3.Connection, events: list[dict], status: str) -> None:
     """Save events as sent or skipped. Events that are already saved are left alone."""
-    recorded_at = datetime.now(timezone.utc).isoformat()
     with connection:
-        connection.executemany(
-            """INSERT INTO alerts (url, first_failure_id, event, check_id, status, recorded_at)
-               VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(first_failure_id, event) DO NOTHING""",
-            [(event["incident"]["url"], event["incident"]["first_failure_id"], event["event"],
-              event["check_id"], status, recorded_at) for event in events],
-        )
+        _insert(connection, events, status)
+
+
+def _insert(connection: sqlite3.Connection, events: list[dict], status: str) -> None:
+    recorded_at = datetime.now(timezone.utc).isoformat()
+    connection.executemany(
+        """INSERT INTO alerts (url, first_failure_id, event, check_id, status, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(first_failure_id, event) DO NOTHING""",
+        [(event["incident"]["url"], event["incident"]["first_failure_id"], event["event"],
+          event["check_id"], status, recorded_at) for event in events],
+    )
+
+
+def enabled_after(connection: sqlite3.Connection) -> int | None:
+    """Return the last check ID from before alerting was first enabled, or None if it never was."""
+    row = connection.execute("SELECT after_check_id FROM alerting WHERE id = 1").fetchone()
+    return None if row is None else row["after_check_id"]
 
 
 def skip_backlog(connection: sqlite3.Connection) -> int:
-    """Mark events that happened before alerting started so they are never sent."""
-    events = pending_alerts(connection)
-    record(connection, events, "skipped")
+    """The first time alerting is enabled, mark events already in history as skipped. Return how many."""
+    if enabled_after(connection) is not None:
+        return 0
+    last = connection.execute("SELECT COALESCE(MAX(id), 0) FROM checks").fetchone()[0]
+    events = [event for event in pending_alerts(connection) if event["check_id"] <= last]
+    with connection:
+        _insert(connection, events, "skipped")
+        # Everything after this check is owed an alert, even if no watcher is running when it happens.
+        connection.execute("INSERT INTO alerting (id, enabled_at, after_check_id) VALUES (1, ?, ?) "
+                           "ON CONFLICT(id) DO NOTHING", (datetime.now(timezone.utc).isoformat(), last))
     return len(events)
+
+
+def unsent_alerts(connection: sqlite3.Connection) -> list[dict]:
+    """Return the events the next alerting watcher would send, oldest first."""
+    if enabled_after(connection) is None:
+        return []
+    return [payload(event) for event in pending_alerts(connection)]
+
+
+def start(connection: sqlite3.Connection, webhook: str) -> list[dict]:
+    """Prepare a watcher to alert, sending any events missed while no alerting watcher was running."""
+    skipped = skip_backlog(connection)
+    if skipped:
+        print(f"Skipped {skipped} earlier incident event(s); alerting on new ones.", file=sys.stderr, flush=True)
+    missed = len(pending_alerts(connection))
+    if not missed:
+        return []
+    print(f"Sending {missed} incident event(s) not alerted yet.", file=sys.stderr, flush=True)
+    return deliver(connection, webhook)
 
 
 def payload(event: dict) -> dict:
@@ -121,8 +157,10 @@ def deliver(connection: sqlite3.Connection, webhook: str) -> list[dict]:
     return sent
 
 
-def list_alerts(connection: sqlite3.Connection, limit: int = 20) -> list[dict]:
-    """Return recorded alerts, newest first."""
+def list_alerts(connection: sqlite3.Connection, limit: int = 20, *, pending: bool = False) -> list[dict]:
+    """Return recorded alerts newest first, or with `pending`, unsent events in the order they'd be sent."""
     if type(limit) is not int or not 1 <= limit <= 1000:
         raise ValueError("Alert limit must be between 1 and 1000.")
+    if pending:
+        return unsent_alerts(connection)[:limit]
     return [dict(row) for row in connection.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,))]

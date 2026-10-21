@@ -107,6 +107,20 @@ def main():
         assert "<title>Uptime Monitor</title>" in page and "/api/summary" in page, page[:200]
         assert len(json.loads(command("history", "--limit", "100"))) == 7
         print("Read-only API and dashboard passed.", flush=True)
+
+        # An incident that opens while no alerting watcher runs is sent when the next one starts.
+        command("add", "missing", "http://fixture:8000/missing", "--timeout", "2")
+        command("run", "missing", expected=1)
+        command("run", "missing", expected=1)
+        pending, = json.loads(command("alerts", "--pending"))
+        assert (pending["event"], pending["url"]) == ("opened", "http://fixture:8000/missing"), pending
+        command("watch", "--interval", "1", "--count", "1", "--alert-webhook", webhook, expected=1)
+        received = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, "http://127.0.0.1:8000/alerts"]))
+        assert [(alert["event"], alert["url"]) for alert in received[2:]] == [
+            ("opened", "http://fixture:8000/missing")], received
+        assert received[2]["incident"] == pending["incident"], received
+        assert json.loads(command("alerts", "--pending")) == []
+        print("Alerts missed while no watcher was running passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
