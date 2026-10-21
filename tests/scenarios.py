@@ -168,7 +168,7 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3) -> dict:
             due = next(r for r in range(index, len(alerting)) if alerting[r] and webhook[r] == "up")
             expected[(url, event, first)] = (index, due)
     delivered = [((body["url"], body["event"], rounds_by_id[body["incident"]["first_failure_id"]]), arrived)
-                 for body, arrived, accepted in receiver.received if accepted]
+                 for body, arrived, accepted, _key in receiver.received if accepted]
     copies = Counter(key for key, _ in delivered)
     arrivals = {key: arrived for key, arrived in reversed(delivered)}
     order = [key for key, _ in delivered]
@@ -185,7 +185,9 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3) -> dict:
         "not_at_first_chance": sum(1 for key, (_, due) in expected.items() if arrivals.get(key, due) != due),
         "max_delay_rounds": max((arrivals[key] - index for key, (index, _) in expected.items() if key in arrivals),
                                 default=0),
+        **receiver.deduplicated(),
     }
     report["ok"] = not any(report[name] for name in ("lost", "unexpected", "duplicates", "out_of_order",
-                                                      "not_at_first_chance"))
+                                                      "not_at_first_chance", "repeated_after_dedupe",
+                                                      "key_collisions", "header_mismatches"))
     return report

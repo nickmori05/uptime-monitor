@@ -98,8 +98,9 @@ class Receiver(_Server):
     """Accept webhook POSTs when `mode(round)` is "up"; otherwise fail them.
 
     "error" answers 500 and "reset" drops the connection. Every body that was read,
-    accepted or not, is kept in `received` with the round it arrived in.
-    `before_reply`, if set, runs after a body is read and before any answer.
+    accepted or not, is kept in `received` with the round it arrived in, whether it
+    was accepted, and its `Idempotency-Key` header. `before_reply`, if set, runs
+    after a body is read and before any answer.
     """
 
     def __init__(self, clock, mode):
@@ -111,7 +112,23 @@ class Receiver(_Server):
 
     def accepted(self) -> list[dict]:
         with self.lock:
-            return [body for body, _round, accepted in self.received if accepted]
+            return [body for body, _round, accepted, _key in self.received if accepted]
+
+    def deduplicated(self) -> dict:
+        """Measure what a receiver that drops repeated idempotency keys would be left with.
+
+        An alert sent under two keys stays repeated, and two alerts sharing a key would
+        lose one. Alerts are told apart by URL, event, and first failed check.
+        """
+        with self.lock:
+            received = list(self.received)
+        pairs = {((body["url"], body["event"], body["incident"]["first_failure_id"]), body["idempotency_key"])
+                 for body, _round, accepted, _key in received if accepted}
+        return {
+            "repeated_after_dedupe": len(pairs) - len({alert for alert, _ in pairs}),
+            "key_collisions": len(pairs) - len({key for _, key in pairs}),
+            "header_mismatches": sum(key != body.get("idempotency_key") for body, _, _, key in received),
+        }
 
 
 class _ReceiverHandler(BaseHTTPRequestHandler):
@@ -122,7 +139,7 @@ class _ReceiverHandler(BaseHTTPRequestHandler):
         if self.server.before_reply is not None:
             self.server.before_reply(body)
         with self.server.lock:
-            self.server.received.append((body, current, mode == "up"))
+            self.server.received.append((body, current, mode == "up", self.headers.get("Idempotency-Key")))
         if mode == "reset":
             self.close_connection = True
             return

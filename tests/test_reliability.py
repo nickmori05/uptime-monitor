@@ -93,6 +93,7 @@ class AlertDeliveryTests(unittest.TestCase):
             "duplicates": patch.object(alerts, "record"),
             "out_of_order": patch.object(alerts, "incident_events",
                                          side_effect=lambda connection: real_events(connection)[::-1]),
+            "key_collisions": patch.object(alerts, "idempotency_key", return_value="same-for-every-alert"),
         }
         for measure, fault in broken.items():
             with self.subTest(measure=measure), fault:
@@ -107,11 +108,14 @@ class CrashTests(unittest.TestCase):
         self.assertTrue(report["ok"], report)
         self.assertGreater(report["kills"], 0, report)
         self.assertGreater(report["expected_alerts"], 0, report)
+        self.assertEqual(report["repeated_after_dedupe"], 0, report)
 
     def test_a_kill_after_the_receiver_accepts_resends_the_alert_once(self):
         report = kill_during_delivery()
         self.assertTrue(report["ok"], report)
         self.assertEqual((report["copies_received"], report["recorded_sent"]), (2, 1))
+        # Both copies carry one key, so a receiver that drops repeated keys acts once.
+        self.assertEqual((report["distinct_keys"], report["repeated_after_dedupe"]), (1, 0))
 
 
 if __name__ == "__main__":

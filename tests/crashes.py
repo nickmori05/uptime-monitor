@@ -85,10 +85,14 @@ def crash_recovery(seed: int = 1, rounds: int = 12, kill_rate: float = 0.5) -> d
         "lost": len(expected - set(copies)), "unexpected": len(set(copies) - expected),
         "repeated_after_kill": sum(count - 1 for count in copies.values()),
         "not_recorded_as_sent": len(expected - recorded),
+        **receiver.deduplicated(),
     }
-    # A kill after the receiver accepts an alert but before it is saved means it is sent again.
+    # A kill after the receiver accepts an alert but before it is saved means it is sent again,
+    # with the same key, so a receiver that drops repeated keys sees each alert once.
     report["ok"] = (integrity == "ok" and not report["lost"] and not report["unexpected"]
-                    and not report["not_recorded_as_sent"] and report["repeated_after_kill"] <= kills)
+                    and not report["not_recorded_as_sent"] and report["repeated_after_kill"] <= kills
+                    and not any(report[name] for name in ("repeated_after_dedupe", "key_collisions",
+                                                          "header_mismatches")))
     return report
 
 
@@ -125,6 +129,9 @@ def kill_during_delivery() -> dict:
         receiver.close()
     copies = [body["event"] for body in receiver.accepted()]
     report = {"scenario": "kill during delivery", "killed": processes[1].returncode < 0, "checks_saved": checks,
-              "copies_received": len(copies), "recorded_sent": sent}
-    report["ok"] = report["killed"] and checks == 3 and copies == ["opened", "opened"] and sent == 1
+              "copies_received": len(copies), "recorded_sent": sent,
+              "distinct_keys": len({body["idempotency_key"] for body in receiver.accepted()}),
+              **receiver.deduplicated()}
+    report["ok"] = (report["killed"] and checks == 3 and copies == ["opened", "opened"] and sent == 1
+                    and report["distinct_keys"] == 1 and not report["header_mismatches"])
     return report
