@@ -131,7 +131,7 @@ With `--alert-webhook`, the watcher POSTs one JSON object after each round for
 every new incident event, using the default thresholds:
 
 ```json
-{"event": "opened", "url": "https://example.com", "text": "Incident opened for ...", "incident": {"...": "..."}}
+{"event": "opened", "url": "https://example.com", "idempotency_key": "5e57d713...", "text": "Incident opened for ...", "incident": {"...": "..."}}
 ```
 
 `event` is `opened` or `resolved`, and `incident` matches the `incidents`
@@ -139,10 +139,18 @@ report. Each event is sent once: sent events are saved in the database, so
 restarts, flapping, and further failures don't repeat them, and several targets
 for one URL share alerts. A delivery that fails (non-`2xx`, redirect, connection
 error, or no answer within about 10 seconds) is logged to stderr and retried
-after the next round, in order. A watcher killed after the receiver accepts an
-alert but before saving that it did sends the alert again when it restarts, so
-receivers that must not repeat an action can deduplicate on
-`incident.first_failure_id` and `event`.
+after the next round, in order.
+
+A watcher killed after the receiver accepts an alert but before saving that it
+did sends the alert again when it restarts. The resent copy has the same
+`idempotency_key`, which is also sent as the `Idempotency-Key` header, so a
+receiver that must not repeat an action can drop any key it has already seen.
+The key is 32 hex characters derived from the URL, the incident's first failed
+check (its ID and time), and the event. It differs between the opening and the
+resolution, and between databases, and it doesn't change when the rest of the
+`incident` object does (a resent copy reports later checks). `alerts` and
+`alerts --pending` show each event's key, for matching against the receiver's
+log.
 
 The first time a watcher starts with `--alert-webhook`, events already in the
 history are recorded as `skipped` instead of sent, so turning alerts on doesn't
@@ -230,13 +238,14 @@ The unit tests use a temporary local HTTP server and temporary databases, with
 connection failures and hung lookups injected, so they need no network access.
 They cover checks and deadlines, targets, batches and their concurrency limit,
 the watcher and its signal handling, incidents, summaries, alerts, webhook
-delivery, and catching up on missed alerts, the API, the dashboard's headers and
+delivery, catching up on missed alerts, and idempotency keys, the API, the dashboard's headers and
 policy, and upgrading older databases.
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
 network: non-root execution, persistence across containers, SIGTERM shutdown,
-deadlines, webhook alerts sent once across restarts, the API and dashboard
+deadlines, webhook alerts sent once across restarts with matching keys in the
+header, body, and `alerts` log, the API and dashboard
 served from another container, and an alert for an incident that opened while
 no watcher was running. Everything it creates is removed afterward.
 
@@ -251,16 +260,19 @@ faults injected by local servers (`tests/faults.py`), and prints one JSON report
 per scenario. It exits `1` if any guarantee fails; `--seed` and `--rounds`
 change the run. Expected incidents come from a separate implementation of the
 incident rules in `tests/scenarios.py`, which the tests cross-check against
-`incidents.py`. The unit tests run the same scenarios at a smaller size, and
-also confirm that the probe and alert scenarios fail when a bug is injected
-(ignored deadlines, or dropped, repeated, or reordered alerts).
+`incidents.py`. The receiver also measures what deduplicating on
+`Idempotency-Key` would leave: alerts still repeated, alerts sharing a key, and
+headers that don't match the body. The unit tests run the same scenarios at a
+smaller size, and also confirm that the probe and alert scenarios fail when a
+bug is injected (ignored deadlines; dropped, repeated, or reordered alerts; or
+one key for every alert).
 
 | Scenario | What it does | Measured (seed 1, defaults) |
 | --- | --- | --- |
 | Probe faults | 8 targets for 20 rounds, each check given one of: `2xx`, `503`, redirect, dropped connection, non-HTTP reply, headers slower than the timeout, headers trickled one byte at a time, or a hung DNS lookup. Timeout 0.4 s, deadline 0.6 s. | 160 checks, 0 misclassified, worst check 36 ms over its limit, slowest round 0.65 s |
-| Alert delivery | 3 targets with random outages for 202 rounds; the webhook fails (`500` or dropped connection) in 55 rounds; the watcher restarts 46 times; 36 rounds are checked by `run-all` with no watcher. | 80 alerts expected, 80 delivered, 0 lost, 0 repeated, 0 out of order, every one at the first round it could be |
-| Crash recovery | 43 rounds, each a new watcher process; 11 were killed with SIGKILL at a random point. | 22 alerts expected, 0 lost, 2 sent again after a kill, database integrity `ok` |
-| Kill during delivery | Kills the watcher after the receiver reads an alert, before it answers. | Received twice, recorded as sent once |
+| Alert delivery | 3 targets with random outages for 202 rounds; the webhook fails (`500` or dropped connection) in 55 rounds; the watcher restarts 46 times; 36 rounds are checked by `run-all` with no watcher. | 80 alerts expected, 80 delivered, 0 lost, 0 repeated, 0 out of order, every one at the first round it could be; 0 key collisions |
+| Crash recovery | 43 rounds, each a new watcher process; 11 were killed with SIGKILL at a random point. | 22 alerts expected, 0 lost, 2 sent again after a kill (same key both times, so 0 repeated after deduplicating), database integrity `ok` |
+| Kill during delivery | Kills the watcher after the receiver reads an alert, before it answers. | Received twice with one key, recorded as sent once |
 
 Timing limits allow 500 ms of slack for slow machines. The numbers above are
 from one run on a laptop. For a given seed the probe and alert counts are the
@@ -274,7 +286,9 @@ same on every run; timings, and how many kills land and where, vary.
   exact outage durations.
 - The socket timeout alone doesn't bound DNS lookups; use a deadline for that.
 - Alert delivery is at least once: a watcher killed mid-delivery repeats that
-  alert after restarting (2 of 22 alerts in the crash scenario above).
+  alert after restarting (2 of 22 alerts in the crash scenario above). The
+  repeat has the same idempotency key, but dropping it is up to the receiver;
+  one that ignores the key acts twice.
 - Alerts use the default incident thresholds and have no backoff. Events missed
   while no watcher was running are only sent once an alerting watcher starts,
   and after a long gap that includes incidents that have since resolved.
@@ -284,7 +298,11 @@ same on every run; timings, and how many kills land and where, vary.
 
 ## Roadmap
 
-1. ~~Add an API and a small dashboard for viewing results.~~ Done: `serve`.
-2. ~~Add alert deduplication and measured reliability tests.~~ Done:
-   `watch --alert-webhook` and `scripts/reliability.py`.
-3. ~~Save a default deadline with each target.~~ Done: `add --deadline`.
+Earlier milestones (the API and dashboard, deduplicated alerts with measured
+reliability, and saved deadlines) are done. Next:
+
+1. ~~Give every alert an idempotency key so receivers can drop repeats.~~ Done:
+   `idempotency_key` and the `Idempotency-Key` header.
+2. Let the watcher skip catch-up incidents that already resolved, sending
+   neither their opening nor their resolution (a `--skip-resolved` option).
+3. Route alerts per target, with each target choosing its own webhook or none.
