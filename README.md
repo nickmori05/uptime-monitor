@@ -5,7 +5,7 @@
 A small HTTP uptime monitor written in standard-library Python. It checks
 endpoints once or on an interval, stores every observation in SQLite, rebuilds
 incidents and summaries from that history, sends a webhook once per incident
-change, and serves the results through a read-only JSON API and dashboard. It
+change (to a webhook per target if you like), and serves the results through a read-only JSON API and dashboard. It
 runs from a clone with no packages to install, or as a hardened Docker Compose
 service.
 
@@ -69,13 +69,15 @@ SIGTERM.
 python3 monitor.py add example https://example.com --timeout 3 --deadline 10
 python3 monitor.py update example --url https://example.com/health
 python3 monitor.py update example --no-deadline
+python3 monitor.py update example --alert-webhook https://hooks.example.com/team
 python3 monitor.py run example
 python3 monitor.py targets
 python3 monitor.py remove example
 ```
 
-A target saves a URL, a timeout, and an optional default deadline under a name
-(1–64 letters, digits, `-` or `_`, starting with a letter or digit). `add` and
+A target saves a URL, a timeout, an optional default deadline, and where its
+alerts go (see [Routing alerts per target](#routing-alerts-per-target)) under a
+name (1–64 letters, digits, `-` or `_`, starting with a letter or digit). `add` and
 `update` never make a request. Removing or re-pointing a target keeps its past
 checks, which stay tied to the URL they were made against. A `--deadline` given
 to `run`, `run-all`, or `watch` overrides saved deadlines for that run only.
@@ -141,7 +143,7 @@ report. Each event is sent once: sent events are saved in the database, so
 restarts, flapping, and further failures don't repeat them, and several targets
 for one URL share alerts. A delivery that fails (non-`2xx`, redirect, connection
 error, or no answer within about 10 seconds) is logged to stderr and retried
-after the next round, in order.
+after the next round, in order (per webhook, when targets have their own).
 
 A watcher killed after the receiver accepts an alert but before saving that it
 did sends the alert again when it restarts. The resent copy has the same
@@ -154,8 +156,9 @@ resolution, and between databases, and it doesn't change when the rest of the
 `alerts --pending` show each event's key, for matching against the receiver's
 log.
 
-The first time a watcher starts with `--alert-webhook`, events already in the
-history are recorded as `skipped` instead of sent, so turning alerts on doesn't
+The first time a watcher alerts (with `--alert-webhook`, or with a target that
+has its own webhook), events already in the history are recorded as `skipped`
+instead of sent, so turning alerts on doesn't
 replay old incidents. From then on nothing is skipped: events from checks made
 while no alerting watcher was running (it was stopped, ran without the flag, or
 checks came from `run` or `run-all`) are sent when the next alerting watcher
@@ -174,6 +177,36 @@ without hearing it close; incidents still open are sent as usual. The option
 applies to that watcher run only. `alerts --pending --skip-resolved` previews
 what such a watcher would send.
 
+#### Routing alerts per target
+
+```sh
+python3 monitor.py add payments https://pay.example.com/health --alert-webhook https://hooks.example.com/payments
+python3 monitor.py add batch https://batch.example.com/health --alert-webhook none
+python3 monitor.py update payments --alert-webhook default
+```
+
+Each target's `alert_webhook` is `default` (the watcher's own `--alert-webhook`,
+which is what every target had before), `none`, or a webhook URL of its own.
+Alerts belong to a URL, so a URL checked by several targets alerts each of
+their distinct webhooks once, and is only silent when all of them say `none`;
+a URL no target checks (one seen only by `check`, or whose target was removed)
+uses the default. Routes are read when an alert is sent, so changing a target
+affects alerts that haven't gone out yet.
+
+Each webhook keeps its own queue. A webhook that fails holds up only the alerts
+owed to it, which are retried in order after the next round, while other
+webhooks carry on. A webhook that accepted an alert isn't sent it again because
+another one is still failing. An alert is listed in `alerts` once every
+webhook it is owed has accepted it, and `alerts --pending` shows each pending
+alert's remaining `routes`. An alert owed nowhere is recorded as `skipped`, so
+turning a target's alerts back on doesn't replay it.
+
+A watcher started without `--alert-webhook` still sends alerts to targets that
+have their own webhook, starting the first round that one exists; alerts owed
+to `default` wait for a watcher that has one. With `--skip-resolved`, an
+incident is only skipped if its opening reached no webhook at all, so every
+webhook that heard it open also hears it close.
+
 ### API and dashboard
 
 ```sh
@@ -185,7 +218,9 @@ curl 'http://127.0.0.1:8080/api/history?limit=5&url=https%3A%2F%2Fexample.com'
 `serve` listens on `127.0.0.1:8080` (`--port 0` picks a free port). It answers
 GET requests for `/api/targets`, `/api/history`, `/api/summary`, and
 `/api/incidents`, which return the same JSON as the matching commands and accept
-their filters as query parameters (URLs must be percent-encoded). Invalid or
+their filters as query parameters (URLs must be percent-encoded). The one
+difference is that `/api/targets` shows a target's own webhook only as
+`"webhook"`, since webhook URLs often carry a secret token. Invalid or
 unknown parameters return `400`, unknown paths `404`, and other methods `405`.
 
 `/` serves `dashboard.html`: a single static page that lists each target's
@@ -213,20 +248,22 @@ down` but not `down --volumes`. Add targets before starting it; the watcher exit
 when none remain. Compose allows 75 seconds for SIGTERM shutdown, which the
 20-second deadline stays well inside. Inside the container, `localhost` is the
 container itself. To send alerts, add `--alert-webhook URL` to the service
-`command` in `compose.yml`.
+`command` in `compose.yml`, or give targets their own webhooks.
 
 ## Design
 
 - `monitor.py`: the command line, request probing, SQLite storage, targets,
   batches, and the watcher.
 - `incidents.py`: rebuilds incidents from saved checks.
-- `alerts.py`: finds unsent incident events and delivers them to a webhook.
+- `alerts.py`: finds unsent incident events and delivers them to webhooks.
+- `routing.py`: works out which webhooks each URL's alerts go to.
 - `api.py` and `dashboard.html`: the read-only HTTP API and the static dashboard.
 
-All state lives in one SQLite file with four tables: `checks` (one row per
+All state lives in one SQLite file with five tables: `checks` (one row per
 observation), `targets`, `alerts` (one row per sent or skipped incident event,
-unique per event), and `alerting` (a single row saving the last check from
-before alerts were first enabled; every event after it is owed an alert).
+unique per event), `deliveries` (one row per webhook route an event reached),
+and `alerting` (a single row saving the last check from before alerts were
+first enabled; every event after it is owed an alert).
 Incidents and summaries are derived from `checks` on demand rather than stored,
 and checks are ordered by row ID rather than by timestamp, so a clock change
 can't reorder history. `connect` creates missing tables and columns, so
@@ -252,8 +289,8 @@ connection failures and hung lookups injected, so they need no network access.
 They cover checks and deadlines, targets, batches and their concurrency limit,
 the watcher and its signal handling, incidents, summaries, alerts, webhook
 delivery, catching up on missed alerts, skipping incidents that already
-resolved, and idempotency keys, the API, the dashboard's headers and policy, and
-upgrading older databases.
+resolved, routing alerts per target, and idempotency keys, the API, the
+dashboard's headers and policy, and upgrading older databases.
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
@@ -261,9 +298,10 @@ network: non-root execution, persistence across containers, SIGTERM shutdown,
 deadlines, webhook alerts sent once across restarts with matching keys in the
 header, body, and `alerts` log, the API and dashboard
 served from another container, an alert for an incident that opened while
-no watcher was running, and `--skip-resolved` skipping one that opened and
-resolved while no watcher was running. Everything it creates is removed
-afterward.
+no watcher was running, `--skip-resolved` skipping one that opened and
+resolved while no watcher was running, and a watcher with no webhook of its own
+sending a target's alert to that target's webhook while a muted target stays
+silent. Everything it creates is removed afterward.
 
 GitHub Actions runs `ruff check`, the unit tests and the reliability report on
 Python 3.10 and 3.14, and the Docker smoke test. Lint settings are in
@@ -281,13 +319,15 @@ incident rules in `tests/scenarios.py`, which the tests cross-check against
 headers that don't match the body. The unit tests run the same scenarios at a
 smaller size, and also confirm that the probe and alert scenarios fail when a
 bug is injected (ignored deadlines; dropped, repeated, or reordered alerts; one
-key for every alert; or skipping too few or too many incidents).
+key for every alert; skipping too few or too many incidents; ignoring routes; or
+one failing webhook holding up the others).
 
 | Scenario | What it does | Measured (seed 1, defaults) |
 | --- | --- | --- |
 | Probe faults | 8 targets for 20 rounds, each check given one of: `2xx`, `503`, redirect, dropped connection, non-HTTP reply, headers slower than the timeout, headers trickled one byte at a time, or a hung DNS lookup. Timeout 0.4 s, deadline 0.6 s. | 160 checks, 0 misclassified, worst check 36 ms over its limit, slowest round 0.65 s |
 | Alert delivery | 3 targets with random outages for 202 rounds; the webhook fails (`500` or dropped connection) in 55 rounds; the watcher restarts 46 times; 36 rounds are checked by `run-all` with no watcher. | 80 alerts expected, 80 delivered, 0 lost, 0 repeated, 0 out of order, every one at the first round it could be; 0 key collisions |
 | Skip resolved | The same run with `--skip-resolved`. Which incidents resolve before their opening could be sent is worked out separately from the delivery rules. | 2 incidents skipped, 76 alerts expected, 76 delivered, 0 lost, 0 unexpected, 0 out of order, every one at the first round it could be |
+| Routed | The same run with one target on the watcher's webhook, one on its own webhook that fails in 89 of 202 rounds, and one with alerts off. | 50 alerts expected, 50 delivered, 0 lost, 0 misrouted, 0 out of order on either webhook, every one at the first round its own webhook could take it |
 | Crash recovery | 43 rounds, each a new watcher process; 11 were killed with SIGKILL at a random point. | 22 alerts expected, 0 lost, 2 sent again after a kill (same key both times, so 0 repeated after deduplicating), database integrity `ok` |
 | Kill during delivery | Kills the watcher after the receiver reads an alert, before it answers. | Received twice with one key, recorded as sent once |
 
@@ -306,13 +346,17 @@ same on every run; timings, and how many kills land and where, vary.
   alert after restarting (2 of 22 alerts in the crash scenario above). The
   repeat has the same idempotency key, but dropping it is up to the receiver;
   one that ignores the key acts twice.
-- Alerts use the default incident thresholds and have no backoff. Events missed
+- Alerts use the default incident thresholds and have no backoff: a failing
+  webhook is retried every round, and its queue only shows in `alerts
+  --pending`. Events missed
   while no watcher was running are only sent once an alerting watcher starts,
   and after a long gap that includes incidents that have since resolved unless
   the watcher runs with `--skip-resolved`. A skipped incident is gone for good:
   running a later watcher without the option doesn't send it. Databases that
   used alerts before `alerting` existed skip their unsent events once more on
   the next start.
+- Per-target webhooks are stored in plain text in the database, like every
+  other setting; anyone who can read the file can read their tokens.
 - The API and dashboard have no authentication, TLS, or write access.
 
 ## Roadmap
@@ -325,4 +369,8 @@ reliability, and saved deadlines) are done. Next:
 2. ~~Let the watcher skip catch-up incidents that already resolved, sending
    neither their opening nor their resolution.~~ Done: `watch --skip-resolved`
    and `alerts --pending --skip-resolved`.
-3. Route alerts per target, with each target choosing its own webhook or none.
+3. ~~Route alerts per target, with each target choosing its own webhook or
+   none.~~ Done: `add`/`update --alert-webhook default|none|URL`, with a
+   separate queue per webhook.
+4. Back off from a failing webhook instead of retrying it every round, and
+   report each webhook's last success, last failure, and queue length.
