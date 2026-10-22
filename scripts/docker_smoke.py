@@ -62,7 +62,10 @@ def main():
         assert received[1]["incident"]["resolution_check_id"] == incident["resolution_check_id"], received
         logged = json.loads(command("alerts"))
         assert [(row["event"], row["status"]) for row in logged] == [("resolved", "sent"), ("opened", "sent")], logged
-        print("Webhook alerts sent once across restarts passed.", flush=True)
+        keys = [alert["idempotency_key"] for alert in received]
+        assert keys == [alert["header_key"] for alert in received] and len(set(keys)) == 2, received
+        assert [row["idempotency_key"] for row in logged] == keys[::-1], logged
+        print("Webhook alerts sent once across restarts, with matching keys, passed.", flush=True)
 
         run(["up", "--detach", "--no-deps", "monitor"])
         deadline = time.monotonic() + 20
@@ -119,6 +122,7 @@ def main():
         assert [(alert["event"], alert["url"]) for alert in received[2:]] == [
             ("opened", "http://fixture:8000/missing")], received
         assert received[2]["incident"] == pending["incident"], received
+        assert received[2]["idempotency_key"] == received[2]["header_key"] == pending["idempotency_key"], received
         assert json.loads(command("alerts", "--pending")) == []
         print("Alerts missed while no watcher was running passed.", flush=True)
     finally:

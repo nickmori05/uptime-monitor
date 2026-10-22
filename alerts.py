@@ -1,6 +1,7 @@
-"""Send each incident opening and resolution to a webhook exactly once."""
+"""Send each incident opening and resolution to a webhook, keyed so receivers can drop repeats."""
 
 from datetime import datetime, timezone
+import hashlib
 import http.client
 import json
 import sqlite3
@@ -95,6 +96,17 @@ def start(connection: sqlite3.Connection, webhook: str) -> list[dict]:
     return deliver(connection, webhook)
 
 
+def idempotency_key(url: str, first_failure_id: int, opened_at: str, event: str) -> str:
+    """Return the key for one incident event: the same on every resend, and distinct across events and databases.
+
+    It depends only on the event and the incident's first failed check, never on later
+    checks, so a copy sent again after a restart carries the same key. The URL and the
+    first failure's timestamp keep two databases from producing the same key.
+    """
+    material = json.dumps([url, first_failure_id, opened_at, event], separators=(",", ":"))
+    return hashlib.sha256(material.encode()).hexdigest()[:32]
+
+
 def payload(event: dict) -> dict:
     """Build the JSON body sent to the webhook for one event."""
     incident = event["incident"]
@@ -102,13 +114,17 @@ def payload(event: dict) -> dict:
         text = f"Incident opened for {incident['url']}: failing since {incident['opened_at']}."
     else:
         text = f"Incident resolved for {incident['url']}: recovered at {incident['resolved_at']}."
-    return {"event": event["event"], "url": incident["url"], "text": text, "incident": incident}
+    key = idempotency_key(incident["url"], incident["first_failure_id"], incident["opened_at"], event["event"])
+    return {"event": event["event"], "url": incident["url"], "idempotency_key": key, "text": text,
+            "incident": incident}
 
 
 def post(webhook: str, body: dict, timeout: float) -> str | None:
     """Send one POST and return None on a 2xx response, or a short error code."""
-    request = Request(webhook, data=json.dumps(body).encode(), method="POST",
-                      headers={"Content-Type": "application/json", "User-Agent": "uptime-monitor/0.1"})
+    headers = {"Content-Type": "application/json", "User-Agent": "uptime-monitor/0.1"}
+    if body.get("idempotency_key") is not None:
+        headers["Idempotency-Key"] = body["idempotency_key"]
+    request = Request(webhook, data=json.dumps(body).encode(), method="POST", headers=headers)
     try:
         with build_opener(NoRedirects()).open(request, timeout=timeout) as response:
             status = response.status
@@ -163,4 +179,16 @@ def list_alerts(connection: sqlite3.Connection, limit: int = 20, *, pending: boo
         raise ValueError("Alert limit must be between 1 and 1000.")
     if pending:
         return unsent_alerts(connection)[:limit]
-    return [dict(row) for row in connection.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,))]
+    rows = connection.execute(
+        """SELECT alerts.*, checks.checked_at AS opened_at FROM alerts
+           LEFT JOIN checks ON checks.id = alerts.first_failure_id
+           ORDER BY alerts.id DESC LIMIT ?""", (limit,))
+    listed = []
+    for row in rows:
+        alert = dict(row)
+        opened_at = alert.pop("opened_at")
+        # Shows the key each sent alert carried, so it can be matched against the receiver's log.
+        alert["idempotency_key"] = None if opened_at is None else idempotency_key(
+            alert["url"], alert["first_failure_id"], opened_at, alert["event"])
+        listed.append(alert)
+    return listed
