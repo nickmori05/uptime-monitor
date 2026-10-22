@@ -123,8 +123,10 @@ unknown.
 
 ```sh
 python3 monitor.py watch --interval 30 --alert-webhook https://hooks.example.com/uptime
+python3 monitor.py watch --interval 30 --alert-webhook https://hooks.example.com/uptime --skip-resolved
 python3 monitor.py alerts
 python3 monitor.py alerts --pending
+python3 monitor.py alerts --pending --skip-resolved
 ```
 
 With `--alert-webhook`, the watcher POSTs one JSON object after each round for
@@ -160,6 +162,17 @@ checks came from `run` or `run-all`) are sent when the next alerting watcher
 starts, oldest first, before its first round. `alerts` lists sent and skipped
 events, newest first, and `alerts --pending` lists the events the next alerting
 watcher will send, in order.
+
+After a long gap that catch-up can include incidents that are already over,
+sent as an opening followed straight away by its resolution. With
+`--skip-resolved`, the watcher instead records an incident as `skipped`, sending
+neither event, when it resolved before its opening was sent. That covers
+incidents that came and went while no alerting watcher was running and ones
+that resolved while the webhook was failing. A resolution is still sent
+whenever its opening was, so a receiver never hears about an incident opening
+without hearing it close; incidents still open are sent as usual. The option
+applies to that watcher run only. `alerts --pending --skip-resolved` previews
+what such a watcher would send.
 
 ### API and dashboard
 
@@ -238,16 +251,19 @@ The unit tests use a temporary local HTTP server and temporary databases, with
 connection failures and hung lookups injected, so they need no network access.
 They cover checks and deadlines, targets, batches and their concurrency limit,
 the watcher and its signal handling, incidents, summaries, alerts, webhook
-delivery, catching up on missed alerts, and idempotency keys, the API, the dashboard's headers and
-policy, and upgrading older databases.
+delivery, catching up on missed alerts, skipping incidents that already
+resolved, and idempotency keys, the API, the dashboard's headers and policy, and
+upgrading older databases.
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
 network: non-root execution, persistence across containers, SIGTERM shutdown,
 deadlines, webhook alerts sent once across restarts with matching keys in the
 header, body, and `alerts` log, the API and dashboard
-served from another container, and an alert for an incident that opened while
-no watcher was running. Everything it creates is removed afterward.
+served from another container, an alert for an incident that opened while
+no watcher was running, and `--skip-resolved` skipping one that opened and
+resolved while no watcher was running. Everything it creates is removed
+afterward.
 
 GitHub Actions runs `ruff check`, the unit tests and the reliability report on
 Python 3.10 and 3.14, and the Docker smoke test. Lint settings are in
@@ -264,13 +280,14 @@ incident rules in `tests/scenarios.py`, which the tests cross-check against
 `Idempotency-Key` would leave: alerts still repeated, alerts sharing a key, and
 headers that don't match the body. The unit tests run the same scenarios at a
 smaller size, and also confirm that the probe and alert scenarios fail when a
-bug is injected (ignored deadlines; dropped, repeated, or reordered alerts; or
-one key for every alert).
+bug is injected (ignored deadlines; dropped, repeated, or reordered alerts; one
+key for every alert; or skipping too few or too many incidents).
 
 | Scenario | What it does | Measured (seed 1, defaults) |
 | --- | --- | --- |
 | Probe faults | 8 targets for 20 rounds, each check given one of: `2xx`, `503`, redirect, dropped connection, non-HTTP reply, headers slower than the timeout, headers trickled one byte at a time, or a hung DNS lookup. Timeout 0.4 s, deadline 0.6 s. | 160 checks, 0 misclassified, worst check 36 ms over its limit, slowest round 0.65 s |
 | Alert delivery | 3 targets with random outages for 202 rounds; the webhook fails (`500` or dropped connection) in 55 rounds; the watcher restarts 46 times; 36 rounds are checked by `run-all` with no watcher. | 80 alerts expected, 80 delivered, 0 lost, 0 repeated, 0 out of order, every one at the first round it could be; 0 key collisions |
+| Skip resolved | The same run with `--skip-resolved`. Which incidents resolve before their opening could be sent is worked out separately from the delivery rules. | 2 incidents skipped, 76 alerts expected, 76 delivered, 0 lost, 0 unexpected, 0 out of order, every one at the first round it could be |
 | Crash recovery | 43 rounds, each a new watcher process; 11 were killed with SIGKILL at a random point. | 22 alerts expected, 0 lost, 2 sent again after a kill (same key both times, so 0 repeated after deduplicating), database integrity `ok` |
 | Kill during delivery | Kills the watcher after the receiver reads an alert, before it answers. | Received twice with one key, recorded as sent once |
 
@@ -291,9 +308,11 @@ same on every run; timings, and how many kills land and where, vary.
   one that ignores the key acts twice.
 - Alerts use the default incident thresholds and have no backoff. Events missed
   while no watcher was running are only sent once an alerting watcher starts,
-  and after a long gap that includes incidents that have since resolved.
-  Databases that used alerts before `alerting` existed skip their unsent
-  events once more on the next start.
+  and after a long gap that includes incidents that have since resolved unless
+  the watcher runs with `--skip-resolved`. A skipped incident is gone for good:
+  running a later watcher without the option doesn't send it. Databases that
+  used alerts before `alerting` existed skip their unsent events once more on
+  the next start.
 - The API and dashboard have no authentication, TLS, or write access.
 
 ## Roadmap
@@ -303,6 +322,7 @@ reliability, and saved deadlines) are done. Next:
 
 1. ~~Give every alert an idempotency key so receivers can drop repeats.~~ Done:
    `idempotency_key` and the `Idempotency-Key` header.
-2. Let the watcher skip catch-up incidents that already resolved, sending
-   neither their opening nor their resolution (a `--skip-resolved` option).
+2. ~~Let the watcher skip catch-up incidents that already resolved, sending
+   neither their opening nor their resolution.~~ Done: `watch --skip-resolved`
+   and `alerts --pending --skip-resolved`.
 3. Route alerts per target, with each target choosing its own webhook or none.
