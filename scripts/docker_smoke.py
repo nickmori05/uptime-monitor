@@ -140,6 +140,23 @@ def main():
         assert {row["url"] for row in logged} == {"http://fixture:8000/blip"}, logged
         assert json.loads(command("alerts", "--pending")) == []
         print("Skipping incidents that resolved before a watcher started passed.", flush=True)
+
+        # A target with its own webhook alerts there even from a watcher without one; a muted target never does.
+        command("add", "team", "http://fixture:8000/team", "--timeout", "2",
+                "--alert-webhook", "http://fixture:8000/team-webhook")
+        command("add", "quiet", "http://fixture:8000/quiet", "--timeout", "2", "--alert-webhook", "none")
+        command("watch", "--interval", "1", "--count", "2", expected=1)
+        received = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, "http://127.0.0.1:8000/alerts"]))
+        assert [(alert["event"], alert["url"], alert["path"]) for alert in received[3:]] == [
+            ("opened", "http://fixture:8000/team", "/team-webhook")], received
+        assert {alert["path"] for alert in received[:3]} == {"/webhook"}, received
+        assert received[3]["idempotency_key"] == received[3]["header_key"], received
+        logged = {row["url"]: row["status"] for row in json.loads(command("alerts", "--limit", "2"))}
+        assert logged == {"http://fixture:8000/team": "sent", "http://fixture:8000/quiet": "skipped"}, logged
+        served = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/targets"]))
+        routes = {target["name"]: target["alert_webhook"] for target in served}
+        assert (routes["team"], routes["quiet"], routes["service"]) == ("webhook", "none", "default"), routes
+        print("Per-target alert routing passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)

@@ -11,11 +11,11 @@ class Endpoint(BaseHTTPRequestHandler):
     alerts = []
 
     def do_POST(self):
-        if self.path != "/webhook":
+        if self.path not in ("/webhook", "/team-webhook"):
             return self.reply(404)
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        # Keep the header beside the body so the smoke test can compare them.
-        Endpoint.alerts.append({**body, "header_key": self.headers.get("Idempotency-Key")})
+        # Keep the header and path beside the body so the smoke test can check them.
+        Endpoint.alerts.append({**body, "header_key": self.headers.get("Idempotency-Key"), "path": self.path})
         self.reply(204)
 
     def do_GET(self):

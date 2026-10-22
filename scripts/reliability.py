@@ -28,6 +28,7 @@ def main(argv: list[str] | None = None) -> int:
         lambda: probe_faults(seed=args.seed, rounds=max(8, args.rounds // 10)),
         lambda: alert_delivery(seed=args.seed, rounds=args.rounds),
         lambda: alert_delivery(seed=args.seed, rounds=args.rounds, skip_resolved=True),
+        lambda: alert_delivery(seed=args.seed, rounds=args.rounds, routed=True),
         lambda: crash_recovery(seed=args.seed, rounds=max(10, args.rounds // 5)),
         kill_during_delivery,
     ]

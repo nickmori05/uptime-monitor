@@ -126,6 +126,7 @@ class SkipResolvedTests(unittest.TestCase):
                          ["https://a.example", "https://a.example", "https://b.example"])
         preview = alerts.list_alerts(self.connection, pending=True, skip_resolved=True)
         self.assertEqual(alerts.list_alerts(self.connection), [])
+        self.assertEqual({tuple(body.pop("routes")) for body in preview}, {("default",)})
         delivered, _ = self.start()
         self.assertEqual(delivered, preview)
         with self.assertRaises(ValueError):

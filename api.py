@@ -12,6 +12,7 @@ import sys
 from urllib.parse import parse_qs, urlsplit
 
 from incidents import list_incidents
+import routing
 
 DASHBOARD = Path(__file__).resolve().with_name("dashboard.html")
 
@@ -64,7 +65,8 @@ def routes(store) -> dict:
         )
 
     return {
-        "/api/targets": ((), lambda connection, query: store.list_targets(connection)),
+        "/api/targets": ((), lambda connection, query: [routing.public(target)
+                                                         for target in store.list_targets(connection)]),
         "/api/history": (("limit", "url"), lambda connection, query: store.history(
             connection, query.integer("limit", 20), query.text("url"))),
         "/api/summary": (("url", "target", "last", "state"), summary),

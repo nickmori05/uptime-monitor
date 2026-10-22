@@ -1,4 +1,4 @@
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
 import random
 import tempfile
@@ -10,6 +10,7 @@ from crashes import crash_recovery, kill_during_delivery
 from faults import EXPECTED
 from incidents import scan_incidents
 import monitor
+import routing
 from scenarios import alert_delivery, oracle, probe_faults
 
 
@@ -123,6 +124,47 @@ class SkipResolvedDeliveryTests(unittest.TestCase):
         for measure, fault in broken.items():
             with self.subTest(measure=measure), fault:
                 report = alert_delivery(seed=2, rounds=30, skip_resolved=True)
+                self.assertFalse(report["ok"])
+                self.assertGreater(report[measure], 0, report)
+
+
+class RoutedDeliveryTests(unittest.TestCase):
+    def test_each_route_gets_its_alerts_in_order_whatever_the_others_do(self):
+        for seed in (1, 8):
+            with self.subTest(seed=seed):
+                report = alert_delivery(seed=seed, rounds=30, routed=True)
+                self.assertTrue(report["ok"], report)
+                self.assertGreater(report["rounds_with_own_webhook_down"], 0, report)
+                self.assertEqual(report["delivered"], report["expected_alerts"])
+
+    def test_ignoring_routes_or_sharing_one_queue_is_caught(self):
+        real_send, real_plan = alerts.send_webhook, alerts.plan
+        blocked = []
+
+        def one_queue_plan(*arguments):
+            blocked.clear()
+            return real_plan(*arguments)
+
+        def one_queue_send(webhook, body):
+            # Any failure holds up every route for the rest of the round, as a single queue would.
+            if blocked:
+                return "connection_error"
+            error = real_send(webhook, body)
+            if error is not None:
+                blocked.append(error)
+            return error
+
+        broken = {
+            "misrouted": [patch.object(routing, "owed", return_value=["default"])],
+            "not_at_first_chance": [patch.object(alerts, "plan", side_effect=one_queue_plan),
+                                    patch.object(alerts, "send_webhook", side_effect=one_queue_send)],
+        }
+        for measure, faults in broken.items():
+            with self.subTest(measure=measure), ExitStack() as stack:
+                for fault in faults:
+                    stack.enter_context(fault)
+                # At this size, seed 8 has rounds where one webhook fails while the other still has alerts to send.
+                report = alert_delivery(seed=8, rounds=30, routed=True)
                 self.assertFalse(report["ok"])
                 self.assertGreater(report[measure], 0, report)
 

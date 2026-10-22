@@ -15,4 +15,4 @@ select = ["E", "F", "W", "I", "B", "UP"]
 
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
-known-first-party = ["alerts", "api", "incidents", "monitor", "crashes", "faults", "scenarios"]
+known-first-party = ["alerts", "api", "incidents", "monitor", "routing", "crashes", "faults", "scenarios"]
