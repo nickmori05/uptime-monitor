@@ -1,4 +1,4 @@
-"""HTTP fixture for the Docker smoke test: a flaky service, a slow endpoint, and a webhook receiver."""
+"""HTTP fixture for the Docker smoke test: flaky services, a slow endpoint, and a webhook receiver."""
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
@@ -6,7 +6,8 @@ import time
 
 
 class Endpoint(BaseHTTPRequestHandler):
-    checks = 0
+    # Each flaky path answers 503 to its first two checks and 204 after that.
+    checks = {"/service": 0, "/blip": 0}
     alerts = []
 
     def do_POST(self):
@@ -25,9 +26,9 @@ class Endpoint(BaseHTTPRequestHandler):
         elif self.path == "/slow":
             time.sleep(3)
             status = 200
-        elif self.path == "/service":
-            Endpoint.checks += 1
-            status = 503 if Endpoint.checks <= 2 else 204
+        elif self.path in Endpoint.checks:
+            Endpoint.checks[self.path] += 1
+            status = 503 if Endpoint.checks[self.path] <= 2 else 204
         else:
             status = 404
         self.reply(status)

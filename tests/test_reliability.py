@@ -102,6 +102,31 @@ class AlertDeliveryTests(unittest.TestCase):
                 self.assertGreater(report[measure], 0, report)
 
 
+class SkipResolvedDeliveryTests(unittest.TestCase):
+    def test_incidents_resolved_before_their_opening_is_sent_arrive_not_at_all(self):
+        # At this size, seeds 2 and 3 each include an incident that resolves before its opening can be sent.
+        for seed in (2, 3):
+            with self.subTest(seed=seed):
+                report = alert_delivery(seed=seed, rounds=30, skip_resolved=True)
+                self.assertTrue(report["ok"], report)
+                self.assertGreater(report["skipped_incidents"], 0, report)
+                self.assertEqual(report["delivered"], report["expected_alerts"])
+
+    def test_skipping_too_little_or_too_much_is_caught(self):
+        def every_resolved(_connection, events):
+            return [event for event in events if event["incident"]["state"] == "resolved"]
+
+        broken = {
+            "unexpected": patch.object(alerts, "skip_resolved_incidents", return_value=0),
+            "lost": patch.object(alerts, "resolved_unsent", side_effect=every_resolved),
+        }
+        for measure, fault in broken.items():
+            with self.subTest(measure=measure), fault:
+                report = alert_delivery(seed=2, rounds=30, skip_resolved=True)
+                self.assertFalse(report["ok"])
+                self.assertGreater(report[measure], 0, report)
+
+
 class CrashTests(unittest.TestCase):
     def test_sigkill_loses_no_alerts_and_keeps_the_database_intact(self):
         report = crash_recovery(seed=1)

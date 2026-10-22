@@ -77,23 +77,59 @@ def skip_backlog(connection: sqlite3.Connection) -> int:
     return len(events)
 
 
-def unsent_alerts(connection: sqlite3.Connection) -> list[dict]:
-    """Return the events the next alerting watcher would send, oldest first."""
+def resolved_unsent(connection: sqlite3.Connection, events: list[dict]) -> list[dict]:
+    """Return the pending events of incidents that resolved before their opening was sent, oldest first.
+
+    That is an incident whose opening is still pending or was skipped. Both of its
+    events are returned, so it is skipped as a whole and its resolution never
+    arrives for an opening the receiver didn't get.
+    """
+    opened = {row["first_failure_id"] for row in connection.execute(
+        "SELECT first_failure_id FROM alerts WHERE event = 'opened' AND status = 'sent'")}
+    return [event for event in events
+            if event["incident"]["state"] == "resolved" and event["incident"]["first_failure_id"] not in opened]
+
+
+def skip_resolved_incidents(connection: sqlite3.Connection) -> int:
+    """Mark incidents that resolved before their opening was sent as skipped. Return how many incidents."""
+    events = resolved_unsent(connection, pending_alerts(connection))
+    record(connection, events, "skipped")
+    skipped = len({event["incident"]["first_failure_id"] for event in events})
+    if skipped:
+        print(f"Skipped {skipped} incident(s) that resolved before their opening was sent.",
+              file=sys.stderr, flush=True)
+    return skipped
+
+
+def unsent_alerts(connection: sqlite3.Connection, *, skip_resolved: bool = False) -> list[dict]:
+    """Return the events the next alerting watcher would send, oldest first.
+
+    With `skip_resolved`, leave out the incidents a watcher run with `--skip-resolved` would skip.
+    """
     if enabled_after(connection) is None:
         return []
-    return [payload(event) for event in pending_alerts(connection)]
+    events = pending_alerts(connection)
+    if skip_resolved:
+        skipped = {event["incident"]["first_failure_id"] for event in resolved_unsent(connection, events)}
+        events = [event for event in events if event["incident"]["first_failure_id"] not in skipped]
+    return [payload(event) for event in events]
 
 
-def start(connection: sqlite3.Connection, webhook: str) -> list[dict]:
-    """Prepare a watcher to alert, sending any events missed while no alerting watcher was running."""
+def start(connection: sqlite3.Connection, webhook: str, *, skip_resolved: bool = False) -> list[dict]:
+    """Prepare a watcher to alert, sending any events missed while no alerting watcher was running.
+
+    With `skip_resolved`, missed incidents that have already resolved are skipped instead.
+    """
     skipped = skip_backlog(connection)
     if skipped:
         print(f"Skipped {skipped} earlier incident event(s); alerting on new ones.", file=sys.stderr, flush=True)
+    if skip_resolved:
+        skip_resolved_incidents(connection)
     missed = len(pending_alerts(connection))
     if not missed:
         return []
     print(f"Sending {missed} incident event(s) not alerted yet.", file=sys.stderr, flush=True)
-    return deliver(connection, webhook)
+    return deliver(connection, webhook, skip_resolved=skip_resolved)
 
 
 def idempotency_key(url: str, first_failure_id: int, opened_at: str, event: str) -> str:
@@ -158,8 +194,13 @@ def send_webhook(webhook: str, body: dict, timeout: float = WEBHOOK_TIMEOUT,
     return outcome[0] if outcome else "deadline_exceeded"
 
 
-def deliver(connection: sqlite3.Connection, webhook: str) -> list[dict]:
-    """Send pending alerts in order, stopping at the first failure so it is retried next round."""
+def deliver(connection: sqlite3.Connection, webhook: str, *, skip_resolved: bool = False) -> list[dict]:
+    """Send pending alerts in order, stopping at the first failure so it is retried next round.
+
+    With `skip_resolved`, incidents that resolved before their opening was sent are skipped first.
+    """
+    if skip_resolved:
+        skip_resolved_incidents(connection)
     sent = []
     for event in pending_alerts(connection):
         body = payload(event)
@@ -173,12 +214,18 @@ def deliver(connection: sqlite3.Connection, webhook: str) -> list[dict]:
     return sent
 
 
-def list_alerts(connection: sqlite3.Connection, limit: int = 20, *, pending: bool = False) -> list[dict]:
-    """Return recorded alerts newest first, or with `pending`, unsent events in the order they'd be sent."""
+def list_alerts(connection: sqlite3.Connection, limit: int = 20, *, pending: bool = False,
+                skip_resolved: bool = False) -> list[dict]:
+    """Return recorded alerts newest first, or with `pending`, unsent events in the order they'd be sent.
+
+    `skip_resolved` previews a watcher run with `--skip-resolved`, so it needs `pending`.
+    """
     if type(limit) is not int or not 1 <= limit <= 1000:
         raise ValueError("Alert limit must be between 1 and 1000.")
+    if skip_resolved and not pending:
+        raise ValueError("--skip-resolved previews pending alerts, so it needs --pending.")
     if pending:
-        return unsent_alerts(connection)[:limit]
+        return unsent_alerts(connection, skip_resolved=skip_resolved)[:limit]
     rows = connection.execute(
         """SELECT alerts.*, checks.checked_at AS opened_at FROM alerts
            LEFT JOIN checks ON checks.id = alerts.first_failure_id

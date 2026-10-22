@@ -444,10 +444,14 @@ def parser() -> argparse.ArgumentParser:
     watch.add_argument("--count", type=int, help="Number of batches; omit to keep watching")
     watch.add_argument("--deadline", type=float, help="Per-request limit for every target, overriding saved deadlines")
     watch.add_argument("--alert-webhook", type=url_argument, help="POST incident openings and resolutions to this URL")
+    watch.add_argument("--skip-resolved", action="store_true",
+                       help="Skip incidents that resolved before their opening was sent, sending neither event")
     alert_log = commands.add_parser("alerts", help="Show sent and skipped alerts as JSON")
     alert_log.add_argument("--limit", type=int, default=20, help="Alerts to show, 1–1000 (default: 20)")
     alert_log.add_argument("--pending", action="store_true",
                            help="Show events the next alerting watcher will send instead, oldest first")
+    alert_log.add_argument("--skip-resolved", action="store_true",
+                           help="With --pending, leave out incidents a watcher with --skip-resolved would skip")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=url_argument, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"), help="Only report open or resolved incidents")
@@ -480,18 +484,22 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         with closing(connect(args.database)) as connection:
             if args.command == "watch":
+                if args.skip_resolved and args.alert_webhook is None:
+                    raise ValueError("--skip-resolved only applies to alerts, so it needs --alert-webhook.")
                 if args.alert_webhook is not None:
-                    alerts.start(connection, args.alert_webhook)
+                    alerts.start(connection, args.alert_webhook, skip_resolved=args.skip_resolved)
                 failed = False
                 for batch in watch_targets(connection, interval=args.interval, count=args.count,
                                            workers=args.workers, deadline=args.deadline):
                     failed = failed or any(row["state"] == "down" for row in batch["results"])
                     print(json.dumps(batch), flush=True)
                     if args.alert_webhook is not None:
-                        alerts.deliver(connection, args.alert_webhook)
+                        alerts.deliver(connection, args.alert_webhook, skip_resolved=args.skip_resolved)
                 return 1 if failed else 0
             if args.command == "alerts":
-                print(json.dumps(alerts.list_alerts(connection, args.limit, pending=args.pending), indent=2))
+                listed = alerts.list_alerts(connection, args.limit, pending=args.pending,
+                                            skip_resolved=args.skip_resolved)
+                print(json.dumps(listed, indent=2))
                 return 0
             if args.command == "incidents":
                 results = list_incidents(

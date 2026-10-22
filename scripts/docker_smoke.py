@@ -125,6 +125,21 @@ def main():
         assert received[2]["idempotency_key"] == received[2]["header_key"] == pending["idempotency_key"], received
         assert json.loads(command("alerts", "--pending")) == []
         print("Alerts missed while no watcher was running passed.", flush=True)
+
+        # An incident that opens and resolves while no watcher runs is skipped with --skip-resolved.
+        command("add", "blip", "http://fixture:8000/blip", "--timeout", "2")
+        for expected in (1, 1, 0, 0):
+            command("run", "blip", expected=expected)
+        assert [row["event"] for row in json.loads(command("alerts", "--pending"))] == ["opened", "resolved"]
+        assert json.loads(command("alerts", "--pending", "--skip-resolved")) == []
+        command("watch", "--interval", "1", "--count", "1", "--alert-webhook", webhook, "--skip-resolved", expected=1)
+        received = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, "http://127.0.0.1:8000/alerts"]))
+        assert len(received) == 3, received
+        logged = json.loads(command("alerts", "--limit", "2"))
+        assert [(row["event"], row["status"]) for row in logged] == [("resolved", "skipped"), ("opened", "skipped")]
+        assert {row["url"] for row in logged} == {"http://fixture:8000/blip"}, logged
+        assert json.loads(command("alerts", "--pending")) == []
+        print("Skipping incidents that resolved before a watcher started passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)

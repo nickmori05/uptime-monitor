@@ -117,8 +117,12 @@ def probe_faults(seed: int = 1, rounds: int = 12, timeout: float = 0.4, deadline
     return report
 
 
-def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3) -> dict:
-    """Run outages, webhook failures, restarts, and checks with no alerting watcher; measure each alert's delivery."""
+def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resolved: bool = False) -> dict:
+    """Run outages, webhook failures, restarts, and checks with no alerting watcher; measure each alert's delivery.
+
+    With `skip_resolved`, the watcher runs with `--skip-resolved`, so incidents that
+    resolve before their opening can be sent are expected to arrive not at all.
+    """
     rng = random.Random(seed)
     names = [f"b{index}" for index in range(targets)]
     states = {name: markov(rng, rounds, 0.2, 0.4) + ["up", "up"] for name in names}
@@ -131,6 +135,9 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3) -> dict:
         start += length
     segments.append(("watch", rounds, 2))
     alerting = [kind == "watch" for kind, _, length in segments for _ in range(length)]
+    # A watcher sends missed alerts as it starts, before that round's checks; otherwise after them.
+    starts = {start for kind, start, _ in segments if kind == "watch"}
+    options = ["--skip-resolved"] if skip_resolved else []
     clock = Clock()
     server = Faults(clock, lambda current, name: "ok" if states[name][current] == "up" else "error")
     receiver = Receiver(clock, lambda current: webhook[current])
@@ -149,7 +156,7 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3) -> dict:
                 for kind, _, length in segments:
                     if kind == "watch":
                         cli("watch", "--count", str(length), "--workers", "4", "--alert-webhook",
-                            f"http://127.0.0.1:{receiver.server_port}/alert")
+                            f"http://127.0.0.1:{receiver.server_port}/alert", *options)
                         clock.round += 1
                     else:
                         for _ in range(length):
@@ -161,11 +168,21 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3) -> dict:
         server.close()
         receiver.close()
     rounds_by_id = {row["id"]: index for rows in saved.values() for index, row in enumerate(rows)}
-    expected = {}
+    expected, skipped = {}, 0
     for name in names:
         url = f"http://127.0.0.1:{server.server_port}/{name}"
+        opened_due = {}
         for event, first, index in oracle(states[name]):
             due = next(r for r in range(index, len(alerting)) if alerting[r] and webhook[r] == "up")
+            if event == "opened":
+                opened_due[first] = due
+            elif skip_resolved:
+                # Skipped when the resolution is saved before the opening is sent.
+                sent_at = opened_due[first]
+                if index < sent_at or (index == sent_at and sent_at not in starts):
+                    del expected[(url, "opened", first)]
+                    skipped += 1
+                    continue
             expected[(url, event, first)] = (index, due)
     delivered = [((body["url"], body["event"], rounds_by_id[body["incident"]["first_failure_id"]]), arrived)
                  for body, arrived, accepted, _key in receiver.received if accepted]
@@ -173,11 +190,12 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3) -> dict:
     arrivals = {key: arrived for key, arrived in reversed(delivered)}
     order = [key for key, _ in delivered]
     report = {
-        "scenario": "alert delivery", "seed": seed, "rounds": rounds + 2, "targets": targets,
+        "scenario": "alert delivery" + (" (skip resolved)" if skip_resolved else ""), "seed": seed,
+        "rounds": rounds + 2, "targets": targets,
         "watcher_starts": sum(kind == "watch" for kind, _, _ in segments),
         "rounds_without_alerting": alerting.count(False),
         "rounds_with_webhook_down": sum(mode != "up" for mode in webhook),
-        "expected_alerts": len(expected), "delivered": len(copies),
+        "skipped_incidents": skipped, "expected_alerts": len(expected), "delivered": len(copies),
         "lost": len(set(expected) - set(copies)), "unexpected": len(set(copies) - set(expected)),
         "duplicates": sum(count - 1 for count in copies.values()),
         "out_of_order": sum(1 for a, b in zip(order, order[1:], strict=False)
