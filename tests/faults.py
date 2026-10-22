@@ -38,6 +38,10 @@ class Clock:
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
+    # socketserver's default backlog of 5 is smaller than a round's concurrent checks. On a
+    # loaded Linux runner the extra SYNs are dropped and retried after a second, so a fault
+    # that should answer at once is saved as a timeout instead.
+    request_queue_size = 64
 
     def __init__(self, handler, clock):
         super().__init__(("127.0.0.1", 0), handler)
