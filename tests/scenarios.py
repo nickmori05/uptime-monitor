@@ -117,11 +117,14 @@ def probe_faults(seed: int = 1, rounds: int = 12, timeout: float = 0.4, deadline
     return report
 
 
-def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resolved: bool = False) -> dict:
+def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resolved: bool = False,
+                   routed: bool = False) -> dict:
     """Run outages, webhook failures, restarts, and checks with no alerting watcher; measure each alert's delivery.
 
     With `skip_resolved`, the watcher runs with `--skip-resolved`, so incidents that
-    resolve before their opening can be sent are expected to arrive not at all.
+    resolve before their opening can be sent are expected to arrive not at all. With
+    `routed`, the first target alerts the watcher's webhook, the second its own
+    webhook (which fails on a separate schedule), and the rest have alerts off.
     """
     rng = random.Random(seed)
     names = [f"b{index}" for index in range(targets)]
@@ -138,15 +141,27 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
     # A watcher sends missed alerts as it starts, before that round's checks; otherwise after them.
     starts = {start for kind, start, _ in segments if kind == "watch"}
     options = ["--skip-resolved"] if skip_resolved else []
+    # Which receiver each target's alerts should reach, or None when its alerts are off.
+    route_of = {name: "main" if not routed or index == 0 else "own" if index == 1 else None
+                for index, name in enumerate(names)}
+    schedules = {"main": webhook}
+    if routed:
+        other = random.Random(f"{seed}-own")
+        schedules["own"] = [other.choices(("up", "error", "reset"), (0.6, 0.25, 0.15))[0]
+                            for _ in range(rounds)] + ["up", "up"]
     clock = Clock()
     server = Faults(clock, lambda current, name: "ok" if states[name][current] == "up" else "error")
-    receiver = Receiver(clock, lambda current: webhook[current])
+    receivers = {label: Receiver(clock, lambda current, plan=plan: plan[current]) for label, plan in schedules.items()}
     try:
         with tempfile.TemporaryDirectory() as directory:
             database = str(Path(directory) / "checks.sqlite3")
             with closing(monitor.connect(Path(database))) as connection:
                 for name in names:
-                    monitor.add_target(connection, name, f"http://127.0.0.1:{server.server_port}/{name}", 2)
+                    setting = {"main": "default", None: "none"}.get(route_of[name])
+                    if setting is None:
+                        setting = f"http://127.0.0.1:{receivers['own'].server_port}/own"
+                    monitor.add_target(connection, name, f"http://127.0.0.1:{server.server_port}/{name}", 2,
+                                       alert_webhook=setting)
 
             def cli(*arguments):
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -156,7 +171,7 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
                 for kind, _, length in segments:
                     if kind == "watch":
                         cli("watch", "--count", str(length), "--workers", "4", "--alert-webhook",
-                            f"http://127.0.0.1:{receiver.server_port}/alert", *options)
+                            f"http://127.0.0.1:{receivers['main'].server_port}/alert", *options)
                         clock.round += 1
                     else:
                         for _ in range(length):
@@ -166,14 +181,19 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
                 saved = saved_states(connection)
     finally:
         server.close()
-        receiver.close()
+        for receiver in receivers.values():
+            receiver.close()
     rounds_by_id = {row["id"]: index for rows in saved.values() for index, row in enumerate(rows)}
+    wanted = {f"http://127.0.0.1:{server.server_port}/{name}": route_of[name] for name in names}
     expected, skipped = {}, 0
     for name in names:
         url = f"http://127.0.0.1:{server.server_port}/{name}"
+        if route_of[name] is None:
+            continue
+        plan = schedules[route_of[name]]
         opened_due = {}
         for event, first, index in oracle(states[name]):
-            due = next(r for r in range(index, len(alerting)) if alerting[r] and webhook[r] == "up")
+            due = next(r for r in range(index, len(alerting)) if alerting[r] and plan[r] == "up")
             if event == "opened":
                 opened_due[first] = due
             elif skip_resolved:
@@ -184,28 +204,33 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
                     skipped += 1
                     continue
             expected[(url, event, first)] = (index, due)
-    delivered = [((body["url"], body["event"], rounds_by_id[body["incident"]["first_failure_id"]]), arrived)
+    delivered = [(label, (body["url"], body["event"], rounds_by_id[body["incident"]["first_failure_id"]]), arrived)
+                 for label, receiver in receivers.items()
                  for body, arrived, accepted, _key in receiver.received if accepted]
-    copies = Counter(key for key, _ in delivered)
-    arrivals = {key: arrived for key, arrived in reversed(delivered)}
-    order = [key for key, _ in delivered]
+    copies = Counter(key for _, key, _ in delivered)
+    arrivals = {key: arrived for _, key, arrived in reversed(delivered)}
+    # Order only matters on each route; a failing webhook may fall behind the others.
+    orders = [[key for label, key, _ in delivered if label == route] for route in receivers]
+    deduplicated = [receiver.deduplicated() for receiver in receivers.values()]
     report = {
-        "scenario": "alert delivery" + (" (skip resolved)" if skip_resolved else ""), "seed": seed,
-        "rounds": rounds + 2, "targets": targets,
+        "scenario": "alert delivery" + (" (skip resolved)" if skip_resolved else "") + (" (routed)" if routed else ""),
+        "seed": seed, "rounds": rounds + 2, "targets": targets,
         "watcher_starts": sum(kind == "watch" for kind, _, _ in segments),
         "rounds_without_alerting": alerting.count(False),
-        "rounds_with_webhook_down": sum(mode != "up" for mode in webhook),
+        **{("rounds_with_webhook_down" if label == "main" else f"rounds_with_{label}_webhook_down"):
+           sum(mode != "up" for mode in plan) for label, plan in schedules.items()},
         "skipped_incidents": skipped, "expected_alerts": len(expected), "delivered": len(copies),
         "lost": len(set(expected) - set(copies)), "unexpected": len(set(copies) - set(expected)),
+        "misrouted": sum(1 for label, key, _ in delivered if wanted[key[0]] != label),
         "duplicates": sum(count - 1 for count in copies.values()),
-        "out_of_order": sum(1 for a, b in zip(order, order[1:], strict=False)
+        "out_of_order": sum(1 for order in orders for a, b in zip(order, order[1:], strict=False)
                             if a in expected and b in expected and expected[a][0] > expected[b][0]),
         "not_at_first_chance": sum(1 for key, (_, due) in expected.items() if arrivals.get(key, due) != due),
         "max_delay_rounds": max((arrivals[key] - index for key, (index, _) in expected.items() if key in arrivals),
                                 default=0),
-        **receiver.deduplicated(),
+        **{name: sum(counts[name] for counts in deduplicated) for name in deduplicated[0]},
     }
-    report["ok"] = not any(report[name] for name in ("lost", "unexpected", "duplicates", "out_of_order",
+    report["ok"] = not any(report[name] for name in ("lost", "unexpected", "misrouted", "duplicates", "out_of_order",
                                                       "not_at_first_chance", "repeated_after_dedupe",
                                                       "key_collisions", "header_mismatches"))
     return report
