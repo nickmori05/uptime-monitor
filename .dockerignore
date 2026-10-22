@@ -4,4 +4,5 @@
 !incidents.py
 !api.py
 !alerts.py
+!routing.py
 !dashboard.html

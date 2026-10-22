@@ -22,8 +22,11 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 import alerts
 import api
 from incidents import list_incidents
+import routing
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / ".local" / "checks.sqlite3"
+ALERT_WEBHOOK_COLUMN = ("TEXT NOT NULL DEFAULT 'default' CHECK(alert_webhook IN ('default', 'none') "
+                        "OR alert_webhook LIKE 'http://%' OR alert_webhook LIKE 'https://%')")
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,16 @@ def validate_deadline(deadline: float | None) -> float | None:
     if isinstance(deadline, bool) or not math.isfinite(deadline) or not 0 < deadline <= 60:
         raise ValueError("Deadline must be greater than 0 and at most 60 seconds.")
     return deadline
+
+
+def validate_alert_webhook(value: str) -> str:
+    """Return a target's alert setting if it is `default`, `none`, or a webhook URL, else raise ValueError."""
+    if value in (routing.DEFAULT, routing.NONE):
+        return value
+    try:
+        return validate_url(value)
+    except ValueError as error:
+        raise ValueError(f"Alert webhook must be default, none, or a webhook URL. {error}") from error
 
 
 def request_status(url: str, timeout: float) -> tuple[int | None, str | None]:
@@ -161,11 +174,12 @@ def connect(database: Path) -> sqlite3.Connection:
         )"""
     )
     connection.execute(
-        """CREATE TABLE IF NOT EXISTS targets (
+        f"""CREATE TABLE IF NOT EXISTS targets (
             name TEXT PRIMARY KEY,
             url TEXT NOT NULL,
             timeout REAL NOT NULL CHECK(timeout > 0 AND timeout <= 60),
-            deadline REAL CHECK(deadline IS NULL OR (deadline > 0 AND deadline <= 60))
+            deadline REAL CHECK(deadline IS NULL OR (deadline > 0 AND deadline <= 60)),
+            alert_webhook {ALERT_WEBHOOK_COLUMN}
         )"""
     )
     # Databases created before targets had a saved deadline gain the column empty.
@@ -173,6 +187,9 @@ def connect(database: Path) -> sqlite3.Connection:
     if "deadline" not in columns:
         connection.execute("ALTER TABLE targets ADD COLUMN deadline REAL "
                            "CHECK(deadline IS NULL OR (deadline > 0 AND deadline <= 60))")
+    # Targets saved before alert routing send to the watcher's own webhook, as they always did.
+    if "alert_webhook" not in columns:
+        connection.execute(f"ALTER TABLE targets ADD COLUMN alert_webhook {ALERT_WEBHOOK_COLUMN}")
     connection.execute("CREATE INDEX IF NOT EXISTS checks_url_id ON checks(url, id)")
     # One row per incident event, so an alert is never sent twice for the same change.
     connection.execute(
@@ -193,6 +210,17 @@ def connect(database: Path) -> sqlite3.Connection:
             id INTEGER PRIMARY KEY CHECK(id = 1),
             enabled_at TEXT NOT NULL,
             after_check_id INTEGER NOT NULL CHECK(after_check_id >= 0)
+        )"""
+    )
+    # One row per route an incident event reached, so a failing webhook never holds up or repeats another's.
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS deliveries (
+            id INTEGER PRIMARY KEY,
+            first_failure_id INTEGER NOT NULL,
+            event TEXT NOT NULL CHECK(event IN ('opened', 'resolved')),
+            route TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            UNIQUE(first_failure_id, event, route)
         )"""
     )
     connection.commit()
@@ -261,20 +289,22 @@ def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None =
 
 
 def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: float = 5.0,
-               deadline: float | None = None) -> dict:
+               deadline: float | None = None, alert_webhook: str = routing.DEFAULT) -> dict:
     """Save a new named target without checking it."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
         raise ValueError("Name must be 1–64 letters, digits, hyphens, or underscores, starting with a letter or digit.")
     url = validate_url(url)
     timeout = validate_timeout(timeout)
     deadline = validate_deadline(deadline)
+    alert_webhook = validate_alert_webhook(alert_webhook)
     try:
         with connection:
-            connection.execute("INSERT INTO targets (name, url, timeout, deadline) VALUES (?, ?, ?, ?)",
-                               (name, url, timeout, deadline))
+            connection.execute(
+                "INSERT INTO targets (name, url, timeout, deadline, alert_webhook) VALUES (?, ?, ?, ?, ?)",
+                (name, url, timeout, deadline, alert_webhook))
     except sqlite3.IntegrityError as error:
         raise ValueError(f"A target named '{name}' already exists.") from error
-    return {"name": name, "url": url, "timeout": timeout, "deadline": deadline}
+    return {"name": name, "url": url, "timeout": timeout, "deadline": deadline, "alert_webhook": alert_webhook}
 
 
 def get_target(connection: sqlite3.Connection, name: str) -> dict:
@@ -292,12 +322,15 @@ def list_targets(connection: sqlite3.Connection) -> list[dict]:
 
 def update_target(connection: sqlite3.Connection, name: str, *,
                   url: str | None = None, timeout: float | None = None,
-                  deadline: float | None = None, clear_deadline: bool = False) -> dict:
-    """Change a saved target's URL, timeout, or deadline, keeping settings that aren't given."""
+                  deadline: float | None = None, clear_deadline: bool = False,
+                  alert_webhook: str | None = None) -> dict:
+    """Change a saved target's URL, timeout, deadline, or alert webhook, keeping settings that aren't given."""
     if deadline is not None and clear_deadline:
         raise ValueError("Choose either a new deadline or clearing it, not both.")
-    if url is None and timeout is None and deadline is None and not clear_deadline:
-        raise ValueError("Provide a URL, timeout, or deadline to update.")
+    if url is None and timeout is None and deadline is None and not clear_deadline and alert_webhook is None:
+        raise ValueError("Provide a URL, timeout, deadline, or alert webhook to update.")
+    if alert_webhook is not None:
+        alert_webhook = validate_alert_webhook(alert_webhook)
     if url is not None:
         url = validate_url(url)
     if timeout is not None:
@@ -306,8 +339,9 @@ def update_target(connection: sqlite3.Connection, name: str, *,
     with connection:
         cursor = connection.execute(
             """UPDATE targets SET url = COALESCE(?, url), timeout = COALESCE(?, timeout),
-               deadline = CASE WHEN ? THEN NULL ELSE COALESCE(?, deadline) END WHERE name = ?""",
-            (url, timeout, clear_deadline, deadline, name),
+               deadline = CASE WHEN ? THEN NULL ELSE COALESCE(?, deadline) END,
+               alert_webhook = COALESCE(?, alert_webhook) WHERE name = ?""",
+            (url, timeout, clear_deadline, deadline, alert_webhook, name),
         )
         if cursor.rowcount == 0:
             raise ValueError(f"Target '{name}' does not exist.")
@@ -422,13 +456,16 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("url")
     add.add_argument("--timeout", type=float, default=5.0, help="Socket timeout in seconds (default: 5)")
     add.add_argument("--deadline", type=float, help="Default whole-request limit for this target's runs")
-    update = commands.add_parser("update", help="Change a saved target's URL, timeout, or deadline")
+    add.add_argument("--alert-webhook", default=routing.DEFAULT, metavar="default|none|URL",
+                     help="Where this target's alerts go: the watcher's webhook (default), nowhere, or this URL")
+    update = commands.add_parser("update", help="Change a saved target's URL, timeout, deadline, or alert webhook")
     update.add_argument("name")
     update.add_argument("--url", help="Save a new URL")
     update.add_argument("--timeout", type=float, help="Save a new socket timeout")
     update_deadline = update.add_mutually_exclusive_group()
     update_deadline.add_argument("--deadline", type=float, help="Save a new default deadline")
     update_deadline.add_argument("--no-deadline", action="store_true", help="Clear the saved deadline")
+    update.add_argument("--alert-webhook", metavar="default|none|URL", help="Save where this target's alerts go")
     commands.add_parser("targets", help="List saved targets")
     remove = commands.add_parser("remove", help="Remove a saved target without deleting its history")
     remove.add_argument("name")
@@ -443,7 +480,8 @@ def parser() -> argparse.ArgumentParser:
     watch.add_argument("--interval", type=float, default=30.0, help="Seconds to wait after each batch")
     watch.add_argument("--count", type=int, help="Number of batches; omit to keep watching")
     watch.add_argument("--deadline", type=float, help="Per-request limit for every target, overriding saved deadlines")
-    watch.add_argument("--alert-webhook", type=url_argument, help="POST incident openings and resolutions to this URL")
+    watch.add_argument("--alert-webhook", type=url_argument,
+                       help="POST incident openings and resolutions to this URL, unless a target sets its own")
     watch.add_argument("--skip-resolved", action="store_true",
                        help="Skip incidents that resolved before their opening was sent, sending neither event")
     alert_log = commands.add_parser("alerts", help="Show sent and skipped alerts as JSON")
@@ -484,17 +522,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         with closing(connect(args.database)) as connection:
             if args.command == "watch":
-                if args.skip_resolved and args.alert_webhook is None:
-                    raise ValueError("--skip-resolved only applies to alerts, so it needs --alert-webhook.")
-                if args.alert_webhook is not None:
-                    alerts.start(connection, args.alert_webhook, skip_resolved=args.skip_resolved)
+                if args.skip_resolved and args.alert_webhook is None and not routing.has_webhooks(connection):
+                    raise ValueError("--skip-resolved only applies to alerts, so it needs --alert-webhook "
+                                     "or a target with its own webhook.")
+                alert = alerts.Alerter(connection, args.alert_webhook, skip_resolved=args.skip_resolved)
+                alert()
                 failed = False
                 for batch in watch_targets(connection, interval=args.interval, count=args.count,
                                            workers=args.workers, deadline=args.deadline):
                     failed = failed or any(row["state"] == "down" for row in batch["results"])
                     print(json.dumps(batch), flush=True)
-                    if args.alert_webhook is not None:
-                        alerts.deliver(connection, args.alert_webhook, skip_resolved=args.skip_resolved)
+                    alert()
                 return 1 if failed else 0
             if args.command == "alerts":
                 listed = alerts.list_alerts(connection, args.limit, pending=args.pending,
@@ -516,14 +554,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(summarize(connection, args.last, url, state=args.state), indent=2))
                 return 0
             if args.command == "add":
-                print(json.dumps(add_target(connection, args.name, args.url, args.timeout, args.deadline), indent=2))
+                target = add_target(connection, args.name, args.url, args.timeout, args.deadline, args.alert_webhook)
+                print(json.dumps(target, indent=2))
                 return 0
             if args.command == "targets":
                 print(json.dumps(list_targets(connection), indent=2))
                 return 0
             if args.command == "update":
                 target = update_target(connection, args.name, url=args.url, timeout=args.timeout,
-                                       deadline=args.deadline, clear_deadline=args.no_deadline)
+                                       deadline=args.deadline, clear_deadline=args.no_deadline,
+                                       alert_webhook=args.alert_webhook)
                 print(json.dumps(target, indent=2))
                 return 0
             if args.command == "remove":

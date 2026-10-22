@@ -61,6 +61,15 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.get("/api/summary")[1], monitor.summarize(self.connection))
         self.assertEqual(self.get("/api/incidents")[1], monitor.list_incidents(self.connection))
 
+    def test_targets_show_their_own_webhook_only_as_webhook(self):
+        monitor.add_target(self.connection, "home", "https://example.com",
+                           alert_webhook="https://hooks.example/alert?token=secret")
+        monitor.add_target(self.connection, "quiet", "https://quiet.example", alert_webhook="none")
+        status, targets, _ = self.get("/api/targets")
+        self.assertEqual(status, 200)
+        self.assertEqual([(target["name"], target["alert_webhook"]) for target in targets],
+                         [("home", "webhook"), ("quiet", "none")])
+
     def test_filters_match_the_command_line_options(self):
         monitor.add_target(self.connection, "home", "https://example.com/search?q=a+b&page=2")
         self.save("down", url="https://example.com/search?q=a+b&page=2")
@@ -173,7 +182,7 @@ class ServeCommandTests(unittest.TestCase):
                     with urlopen(address + "/api/targets", timeout=5) as response:
                         targets = json.loads(response.read())
                     self.assertEqual(targets, [{"name": "home", "url": "https://example.com",
-                                                "timeout": 3, "deadline": None}])
+                                                "timeout": 3, "deadline": None, "alert_webhook": "default"}])
                     with urlopen(address + "/", timeout=5) as response:
                         self.assertIn(b"<title>Uptime Monitor</title>", response.read())
                     process.send_signal(stop_signal)

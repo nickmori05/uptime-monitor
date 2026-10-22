@@ -11,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from incidents import scan_incidents
+import routing
 
 WEBHOOK_TIMEOUT = 5.0
 WEBHOOK_DEADLINE = 10.0
@@ -41,10 +42,34 @@ def pending_alerts(connection: sqlite3.Connection) -> list[dict]:
             if (event["incident"]["first_failure_id"], event["event"]) not in recorded]
 
 
-def record(connection: sqlite3.Connection, events: list[dict], status: str) -> None:
-    """Save events as sent or skipped. Events that are already saved are left alone."""
+def record(connection: sqlite3.Connection, events: list[dict], status: str, route: str | None = None) -> None:
+    """Save events as sent or skipped, and with `route`, that they reached it. Saved events are left alone."""
     with connection:
+        if route is not None:
+            _reached(connection, events, route)
         _insert(connection, events, status)
+
+
+def _reached(connection: sqlite3.Connection, events: list[dict], route: str) -> None:
+    connection.executemany(
+        """INSERT INTO deliveries (first_failure_id, event, route, recorded_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(first_failure_id, event, route) DO NOTHING""",
+        [(event["incident"]["first_failure_id"], event["event"], route, datetime.now(timezone.utc).isoformat())
+         for event in events],
+    )
+
+
+def plan(connection: sqlite3.Connection, webhook: str | None) -> list[tuple[dict, list[str], set[str]]]:
+    """Pair each pending event with the routes it is owed and the ones it already reached, oldest first."""
+    table = routing.routes_by_url(connection)
+    reached = {}
+    for row in connection.execute("SELECT first_failure_id, event, route FROM deliveries"):
+        # A target webhook that is also this watcher's default counts as the default route (see `routing.owed`).
+        route = routing.DEFAULT if row["route"] == webhook else row["route"]
+        reached.setdefault((row["first_failure_id"], row["event"]), set()).add(route)
+    return [(event, routing.owed(table, event["incident"]["url"], webhook),
+             reached.get((event["incident"]["first_failure_id"], event["event"]), set()))
+            for event in pending_alerts(connection)]
 
 
 def _insert(connection: sqlite3.Connection, events: list[dict], status: str) -> None:
@@ -80,12 +105,13 @@ def skip_backlog(connection: sqlite3.Connection) -> int:
 def resolved_unsent(connection: sqlite3.Connection, events: list[dict]) -> list[dict]:
     """Return the pending events of incidents that resolved before their opening was sent, oldest first.
 
-    That is an incident whose opening is still pending or was skipped. Both of its
-    events are returned, so it is skipped as a whole and its resolution never
-    arrives for an opening the receiver didn't get.
+    That is an incident whose opening is still pending or was skipped, and reached
+    no route. Both of its events are returned, so it is skipped as a whole and its
+    resolution never arrives for an opening the receiver didn't get.
     """
     opened = {row["first_failure_id"] for row in connection.execute(
-        "SELECT first_failure_id FROM alerts WHERE event = 'opened' AND status = 'sent'")}
+        "SELECT first_failure_id FROM alerts WHERE event = 'opened' AND status = 'sent' "
+        "UNION SELECT first_failure_id FROM deliveries WHERE event = 'opened'")}
     return [event for event in events
             if event["incident"]["state"] == "resolved" and event["incident"]["first_failure_id"] not in opened]
 
@@ -102,20 +128,26 @@ def skip_resolved_incidents(connection: sqlite3.Connection) -> int:
 
 
 def unsent_alerts(connection: sqlite3.Connection, *, skip_resolved: bool = False) -> list[dict]:
-    """Return the events the next alerting watcher would send, oldest first.
+    """Return the events the next alerting watcher would send, oldest first, with the routes each still needs.
 
     With `skip_resolved`, leave out the incidents a watcher run with `--skip-resolved` would skip.
     """
     if enabled_after(connection) is None:
         return []
-    events = pending_alerts(connection)
+    planned = plan(connection, None)
+    skipped = set()
     if skip_resolved:
-        skipped = {event["incident"]["first_failure_id"] for event in resolved_unsent(connection, events)}
-        events = [event for event in events if event["incident"]["first_failure_id"] not in skipped]
-    return [payload(event) for event in events]
+        skipped = {event["incident"]["first_failure_id"]
+                   for event in resolved_unsent(connection, [event for event, _, _ in planned])}
+    unsent = []
+    for event, owed, reached in planned:
+        routes = [route for route in owed if route not in reached]
+        if routes and event["incident"]["first_failure_id"] not in skipped:
+            unsent.append({**payload(event), "routes": routes})
+    return unsent
 
 
-def start(connection: sqlite3.Connection, webhook: str, *, skip_resolved: bool = False) -> list[dict]:
+def start(connection: sqlite3.Connection, webhook: str | None, *, skip_resolved: bool = False) -> list[dict]:
     """Prepare a watcher to alert, sending any events missed while no alerting watcher was running.
 
     With `skip_resolved`, missed incidents that have already resolved are skipped instead.
@@ -125,7 +157,8 @@ def start(connection: sqlite3.Connection, webhook: str, *, skip_resolved: bool =
         print(f"Skipped {skipped} earlier incident event(s); alerting on new ones.", file=sys.stderr, flush=True)
     if skip_resolved:
         skip_resolved_incidents(connection)
-    missed = len(pending_alerts(connection))
+    missed = sum(any(route not in reached and (route != routing.DEFAULT or webhook is not None) for route in owed)
+                 for _, owed, reached in plan(connection, webhook))
     if not missed:
         return []
     print(f"Sending {missed} incident event(s) not alerted yet.", file=sys.stderr, flush=True)
@@ -194,24 +227,59 @@ def send_webhook(webhook: str, body: dict, timeout: float = WEBHOOK_TIMEOUT,
     return outcome[0] if outcome else "deadline_exceeded"
 
 
-def deliver(connection: sqlite3.Connection, webhook: str, *, skip_resolved: bool = False) -> list[dict]:
-    """Send pending alerts in order, stopping at the first failure so it is retried next round.
+def deliver(connection: sqlite3.Connection, webhook: str | None, *, skip_resolved: bool = False) -> list[dict]:
+    """Send pending alerts on every route they are owed, in order on each route. Return the bodies sent.
 
-    With `skip_resolved`, incidents that resolved before their opening was sent are skipped first.
+    A route stops at its first failure this round, so its alerts are retried in
+    order next round, while other routes carry on. The default route needs
+    `webhook`; without one, alerts owed there wait for a watcher that has it. An
+    alert owed nowhere (every target for its URL has alerts off) is skipped. With
+    `skip_resolved`, incidents that resolved before their opening was sent are skipped first.
     """
     if skip_resolved:
         skip_resolved_incidents(connection)
-    sent = []
-    for event in pending_alerts(connection):
+    sent, stopped = [], set()
+    for event, owed, reached in plan(connection, webhook):
+        if reached.issuperset(owed):
+            # Owed nowhere, or every route it still has was reached before the rest were removed.
+            record(connection, [event], "sent" if reached else "skipped")
+            continue
         body = payload(event)
-        error = send_webhook(webhook, body)
-        if error is not None:
-            print(f"Alert not delivered ({error}); retrying next round.", file=sys.stderr, flush=True)
-            break
-        record(connection, [event], "sent")
-        print(f"Alert sent: {body['text']}", file=sys.stderr, flush=True)
-        sent.append(body)
+        for route in owed:
+            if route in reached or route in stopped or (route == routing.DEFAULT and webhook is None):
+                continue
+            error = send_webhook(webhook if route == routing.DEFAULT else route, body)
+            where = routing.describe(route)
+            if error is not None:
+                print(f"Alert not delivered ({error}){where}; retrying next round.", file=sys.stderr, flush=True)
+                stopped.add(route)
+                continue
+            reached.add(route)
+            if reached.issuperset(owed):
+                record(connection, [event], "sent", route)
+            else:
+                with connection:
+                    _reached(connection, [event], route)
+            print(f"Alert sent{where}: {body['text']}", file=sys.stderr, flush=True)
+            sent.append(body)
     return sent
+
+
+class Alerter:
+    """Send one watcher's alerts each round, starting the first time it has somewhere to send them."""
+
+    def __init__(self, connection: sqlite3.Connection, webhook: str | None = None, *, skip_resolved: bool = False):
+        self.connection, self.webhook, self.skip_resolved = connection, webhook, skip_resolved
+        self.started = False
+
+    def __call__(self) -> list[dict]:
+        if self.started:
+            return deliver(self.connection, self.webhook, skip_resolved=self.skip_resolved)
+        # Targets are reloaded every round, so one given a webhook mid-run starts alerting then.
+        if self.webhook is None and not routing.has_webhooks(self.connection):
+            return []
+        self.started = True
+        return start(self.connection, self.webhook, skip_resolved=self.skip_resolved)
 
 
 def list_alerts(connection: sqlite3.Connection, limit: int = 20, *, pending: bool = False,

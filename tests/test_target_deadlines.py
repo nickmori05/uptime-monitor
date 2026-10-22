@@ -27,7 +27,8 @@ class TargetDeadlineTests(unittest.TestCase):
     def test_saved_deadline_survives_reopening(self):
         code, output = self.cli("add", "api", "https://example.com", "--timeout", "3", "--deadline", "10")
         self.assertEqual(code, 0)
-        expected = {"name": "api", "url": "https://example.com", "timeout": 3, "deadline": 10}
+        expected = {"name": "api", "url": "https://example.com", "timeout": 3, "deadline": 10,
+                    "alert_webhook": "default"}
         self.assertEqual(json.loads(output), expected)
         reopened = monitor.connect(self.database)
         self.addCleanup(reopened.close)
@@ -39,7 +40,8 @@ class TargetDeadlineTests(unittest.TestCase):
                 self.assertEqual(self.cli("add", "api", "https://example.com", "--deadline", deadline)[0], 2)
         self.assertEqual(monitor.list_targets(self.connection), [])
         with self.assertRaises(sqlite3.IntegrityError), self.connection:
-            self.connection.execute("INSERT INTO targets VALUES ('raw', 'https://example.com', 5, 0)")
+            self.connection.execute("INSERT INTO targets (name, url, timeout, deadline) "
+                                    "VALUES ('raw', 'https://example.com', 5, 0)")
 
     def test_update_sets_keeps_and_clears_the_deadline(self):
         monitor.add_target(self.connection, "api", "https://example.com", 3)
