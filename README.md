@@ -126,6 +126,7 @@ unknown.
 ```sh
 python3 monitor.py watch --interval 30 --alert-webhook https://hooks.example.com/uptime
 python3 monitor.py watch --interval 30 --alert-webhook https://hooks.example.com/uptime --skip-resolved
+python3 monitor.py watch --interval 30 --alert-webhook https://hooks.example.com/uptime --max-backoff 900
 python3 monitor.py alerts
 python3 monitor.py alerts --pending
 python3 monitor.py alerts --pending --skip-resolved
@@ -144,7 +145,8 @@ report. Each event is sent once: sent events are saved in the database, so
 restarts, flapping, and further failures don't repeat them, and several targets
 for one URL share alerts. A delivery that fails (non-`2xx`, redirect, connection
 error, or no answer within about 10 seconds) is logged to stderr and retried
-after the next round, in order (per webhook, when targets have their own).
+after the next round, in order (per webhook, when targets have their own), or
+later with `--max-backoff` (see [Backing off](#backing-off-from-a-failing-webhook)).
 
 A watcher killed after the receiver accepts an alert but before saving that it
 did sends the alert again when it restarts. The resent copy has the same
@@ -217,10 +219,11 @@ python3 monitor.py webhooks
 ```json
 [{"route": "default", "targets": ["example"], "state": "ok", "pending": 0, "oldest_pending_at": null,
   "last_success_at": "2026-10-25T12:00:31+00:00", "last_failure_at": null, "last_error": null,
-  "consecutive_failures": 0},
+  "consecutive_failures": 0, "retry_at": null},
  {"route": "https://hooks.example.com/payments", "targets": ["payments"], "state": "failing", "pending": 2,
   "oldest_pending_at": "2026-10-25T11:58:02+00:00", "last_success_at": "2026-10-24T09:12:40+00:00",
-  "last_failure_at": "2026-10-25T12:00:31+00:00", "last_error": "http_503", "consecutive_failures": 5}]
+  "last_failure_at": "2026-10-25T12:00:31+00:00", "last_error": "http_503", "consecutive_failures": 5,
+  "retry_at": "2026-10-25T12:08:31+00:00"}]
 ```
 
 Every delivery attempt is saved per route, so `webhooks` can show how each
@@ -234,8 +237,36 @@ failed, `ok` when it succeeded, and `untried` before the first attempt.
 oldest of them happened (the check that opened or resolved its incident), so
 it shows how far behind the webhook is. `last_error` is the code from the last
 failure, which stays on record after the webhook recovers;
-`consecutive_failures` counts failed attempts since the last success. A watcher
-tries each failing webhook once per round, and only while it has alerts to send.
+`consecutive_failures` counts failed attempts since the last success.
+`retry_at` is when a watcher with `--max-backoff` will next try a failing
+webhook; it is `null` when the next round will (always, without the option). A
+watcher only tries a webhook while it has alerts to send.
+
+#### Backing off from a failing webhook
+
+```sh
+python3 monitor.py watch --interval 30 --alert-webhook https://hooks.example.com/uptime --max-backoff 900
+```
+
+By default a failing webhook is tried again every round while it has alerts
+queued, which for a receiver that's down for an hour means 120 failed requests
+and 120 lines on stderr at a 30-second interval. With `--max-backoff SECONDS`,
+the watcher instead leaves a webhook alone for one interval after its first
+failure in a row, then twice as long after each further one (30, 60, 120, 240
+seconds, and so on), up to `SECONDS`, which must be at least the interval and
+at most 86,400. The retry time is saved with the webhook's health, so it holds
+across rounds and shows as `retry_at` in `webhooks`, and stderr says when the
+next try is. Each webhook backs off on its own: the others carry on, and alerts
+waiting for a backing-off webhook stay queued in order. A success resets the
+wait, so the next failure starts from one interval again.
+
+A watcher that starts tries every webhook with alerts owed once straight away,
+whatever its retry time, since restarting the watcher is the usual moment
+after fixing a receiver; a failure then extends the wait as usual. A watcher
+run without the option ignores saved retry times and clears them as it fails.
+The cost is latency: an alert can wait up to `SECONDS` after its webhook
+recovers before it's sent, and longer if the webhook came back briefly during a
+wait and failed again at the next try.
 
 ### API and dashboard
 
@@ -279,7 +310,8 @@ down` but not `down --volumes`. Add targets before starting it; the watcher exit
 when none remain. Compose allows 75 seconds for SIGTERM shutdown, which the
 20-second deadline stays well inside. Inside the container, `localhost` is the
 container itself. To send alerts, add `--alert-webhook URL` to the service
-`command` in `compose.yml`, or give targets their own webhooks.
+`command` in `compose.yml`, or give targets their own webhooks, and add
+`--max-backoff SECONDS` there to back off from failing ones.
 
 ## Design
 
@@ -288,13 +320,15 @@ container itself. To send alerts, add `--alert-webhook URL` to the service
 - `incidents.py`: rebuilds incidents from saved checks.
 - `alerts.py`: finds unsent incident events and delivers them to webhooks.
 - `routing.py`: works out which webhooks each URL's alerts go to.
-- `webhooks.py`: saves each delivery attempt's outcome and reports webhook health.
+- `webhooks.py`: saves each delivery attempt's outcome, works out backoff, and
+  reports webhook health.
 - `api.py` and `dashboard.html`: the read-only HTTP API and the static dashboard.
 
 All state lives in one SQLite file with six tables: `checks` (one row per
 observation), `targets`, `alerts` (one row per sent or skipped incident event,
 unique per event), `deliveries` (one row per webhook route an event reached),
-`webhooks` (one row per route that was ever tried, with its latest outcomes),
+`webhooks` (one row per route that was ever tried, with its latest outcomes and
+any retry time),
 and `alerting` (a single row saving the last check from before alerts were
 first enabled; every event after it is owed an alert).
 Incidents and summaries are derived from `checks` on demand rather than stored,
@@ -322,7 +356,8 @@ connection failures and hung lookups injected, so they need no network access.
 They cover checks and deadlines, targets, batches and their concurrency limit,
 the watcher and its signal handling, incidents, summaries, alerts, webhook
 delivery, catching up on missed alerts, skipping incidents that already
-resolved, routing alerts per target, idempotency keys, and webhook health, the API, the
+resolved, routing alerts per target, idempotency keys, webhook health and
+backoff, the API, the
 dashboard's headers and policy, and upgrading older databases.
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
@@ -334,8 +369,10 @@ served from another container, an alert for an incident that opened while
 no watcher was running, `--skip-resolved` skipping one that opened and
 resolved while no watcher was running, and a watcher with no webhook of its own
 sending a target's alert to that target's webhook while a muted target stays
-silent, and a webhook that refuses alerts reported as failing with its queue,
-by host only in the API. Everything it creates is removed afterward.
+silent, a webhook that refuses alerts reported as failing with its queue, by
+host only in the API, and that webhook left alone for two intervals with
+`--max-backoff` but retried every round without it. Everything it creates is
+removed afterward.
 
 GitHub Actions runs `ruff check`, the unit tests and the reliability report on
 Python 3.10 and 3.14, and the Docker smoke test. Lint settings are in
@@ -353,12 +390,16 @@ incident rules in `tests/scenarios.py`, which the tests cross-check against
 headers that don't match the body. Each alert scenario also compares the
 `webhooks` report with the receivers' own logs (last success, last failure and
 its error, failures in a row, and queue length), against a clock that advances
-30 seconds per round. The unit tests run the same scenarios at a
-smaller size, and also confirm that the probe and alert scenarios fail when a
-bug is injected (ignored deadlines; dropped, repeated, or reordered alerts; one
-key for every alert; skipping too few or too many incidents; ignoring routes;
-one failing webhook holding up the others; or a health report that misses
-successes or failures).
+30 seconds per round. A retry model, also written separately from `alerts.py`,
+replays each webhook's attempts round by round; except with `--skip-resolved`,
+the receivers must see exactly the POSTs it predicts, and with `--max-backoff`
+it decides which round each alert is due. The unit tests run the same scenarios
+at a smaller size, and also confirm that the probe and alert scenarios fail when
+a bug is injected (ignored deadlines; dropped, repeated, or reordered alerts;
+one key for every alert; skipping too few or too many incidents; ignoring
+routes; one failing webhook holding up the others; a health report that misses
+successes or failures; or a backoff that's ignored, has no limit, or holds
+webhooks when a watcher starts).
 
 | Scenario | What it does | Measured (seed 1, defaults) |
 | --- | --- | --- |
@@ -366,6 +407,8 @@ successes or failures).
 | Alert delivery | 3 targets with random outages for 202 rounds; the webhook fails (`500` or dropped connection) in 55 rounds; the watcher restarts 46 times; 36 rounds are checked by `run-all` with no watcher. | 80 alerts expected, 80 delivered, 0 lost, 0 repeated, 0 out of order, every one at the first round it could be; 0 key collisions |
 | Skip resolved | The same run with `--skip-resolved`. Which incidents resolve before their opening could be sent is worked out separately from the delivery rules. | 2 incidents skipped, 76 alerts expected, 76 delivered, 0 lost, 0 unexpected, 0 out of order, every one at the first round it could be |
 | Routed | The same run with one target on the watcher's webhook, one on its own webhook that fails in 89 of 202 rounds, and one with alerts off. | 50 alerts expected, 50 delivered, 0 lost, 0 misrouted, 0 out of order on either webhook, every one at the first round its own webhook could take it; webhook health matched both receivers |
+| Outages | The routed run with both webhooks failing in outages of several rounds instead (down in 65 and 67 of 202 rounds). | 50 alerts expected, 50 delivered, 0 lost, 0 out of order; 109 POSTs, 59 of them failed, exactly as the retry model predicts |
+| Outages with backoff | The same with `--max-backoff 240` (8 rounds). | 50 alerts expected, 50 delivered, 0 lost, 0 out of order, each in the round the retry model predicts; 79 POSTs, 29 failed (half as many); the longest an alert waited past its webhook's first good round was 22 rounds, and past the check that raised it 30 rounds (24 without backoff) |
 | Crash recovery | 43 rounds, each a new watcher process; 11 were killed with SIGKILL at a random point. | 22 alerts expected, 0 lost, 2 sent again after a kill (same key both times, so 0 repeated after deduplicating), database integrity `ok` |
 | Kill during delivery | Kills the watcher after the receiver reads an alert, before it answers. | Received twice with one key, recorded as sent once |
 
@@ -384,8 +427,12 @@ same on every run; timings, and how many kills land and where, vary.
   alert after restarting (2 of 22 alerts in the crash scenario above). The
   repeat has the same idempotency key, but dropping it is up to the receiver;
   one that ignores the key acts twice.
-- Alerts use the default incident thresholds and have no backoff: a failing
-  webhook is retried every round while it has alerts queued. Events missed
+- Alerts use the default incident thresholds. Backoff is opt-in, so without
+  `--max-backoff` a failing webhook is retried every round while it has alerts
+  queued; with it, alerts can wait past a webhook's recovery (22 rounds at
+  most in the scenario above, where webhooks recover briefly mid-outage). The
+  backoff has no jitter, and a crash-looping watcher tries every failing
+  webhook each time it starts. Events missed
   while no watcher was running are only sent once an alerting watcher starts,
   and after a long gap that includes incidents that have since resolved unless
   the watcher runs with `--skip-resolved`. A skipped incident is gone for good:
@@ -414,4 +461,7 @@ reliability, and saved deadlines) are done. Next:
    separate queue per webhook.
 4. ~~Report each webhook's last success, last failure, and queue length.~~
    Done: `webhooks`, `/api/webhooks`, and the dashboard's webhook table.
-5. Back off from a failing webhook instead of retrying it every round.
+5. ~~Back off from a failing webhook instead of retrying it every round.~~
+   Done: `watch --max-backoff`, with `retry_at` in `webhooks`.
+6. Let targets choose their own incident thresholds, for alerts as well as
+   reports.
