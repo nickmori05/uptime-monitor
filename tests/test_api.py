@@ -86,7 +86,7 @@ class ApiTests(unittest.TestCase):
                          [("https://example.com/search?q=a+b&page=2", "open")])
 
     def test_empty_database_returns_empty_lists(self):
-        for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents"):
+        for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents", "/api/webhooks"):
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[:2], (200, []))
 
@@ -124,7 +124,7 @@ class ApiTests(unittest.TestCase):
         self.save("down")
         before = self.database.read_bytes()
         with patch("monitor.probe") as probe, patch("monitor.save") as save:
-            for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents"):
+            for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents", "/api/webhooks"):
                 self.assertEqual(self.get(path)[0], 200)
         probe.assert_not_called()
         save.assert_not_called()
