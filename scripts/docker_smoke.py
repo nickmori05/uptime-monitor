@@ -157,6 +157,24 @@ def main():
         routes = {target["name"]: target["alert_webhook"] for target in served}
         assert (routes["team"], routes["quiet"], routes["service"]) == ("webhook", "none", "default"), routes
         print("Per-target alert routing passed.", flush=True)
+
+        # A webhook that refuses alerts shows as failing with its queue, beside the ones that work.
+        command("add", "broken", "http://fixture:8000/gone", "--timeout", "2",
+                "--alert-webhook", "http://fixture:8000/broken-webhook")
+        command("watch", "--interval", "1", "--count", "2", expected=1)
+        health = {row["route"]: row for row in json.loads(command("webhooks"))}
+        broken = health["http://fixture:8000/broken-webhook"]
+        assert (broken["state"], broken["pending"], broken["targets"]) == ("failing", 1, ["broken"]), broken
+        assert (broken["last_error"], broken["consecutive_failures"], broken["last_success_at"]) == (
+            "http_404", 1, None), broken
+        team = health["http://fixture:8000/team-webhook"]
+        assert (team["state"], team["pending"], team["consecutive_failures"]) == ("ok", 0, 0), team
+        assert health["default"]["state"] == "ok" and health["default"]["pending"] == 0, health["default"]
+        served = run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/webhooks"])
+        assert "broken-webhook" not in served and "team-webhook" not in served, served
+        assert [(row["route"], row["host"], row["state"]) for row in json.loads(served)] == [
+            ("default", None, "ok"), ("webhook", "fixture", "failing"), ("webhook", "fixture", "ok")], served
+        print("Webhook health report passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
