@@ -180,9 +180,10 @@ class WebhookHealthTests(unittest.TestCase):
         real_note = webhooks.note
 
         def only(outcome):
-            def note(connection, route, error):
+            def note(connection, route, error, *backoff):
                 if (error is None) == (outcome == "successes"):
-                    real_note(connection, route, error)
+                    return real_note(connection, route, error, *backoff)
+                return None
             return note
 
         for kept in ("successes", "failures"):

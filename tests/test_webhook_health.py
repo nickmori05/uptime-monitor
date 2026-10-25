@@ -69,9 +69,11 @@ class HealthTests(unittest.TestCase):
         monitor.add_target(self.connection, "c", C, alert_webhook="none")
         self.assertEqual(alerts.webhook_health(self.connection), [
             {"route": "default", "targets": ["a"], "state": "untried", "pending": 0, "oldest_pending_at": None,
-             "last_success_at": None, "last_failure_at": None, "last_error": None, "consecutive_failures": 0},
+             "last_success_at": None, "last_failure_at": None, "last_error": None, "consecutive_failures": 0,
+             "retry_at": None},
             {"route": TEAM, "targets": ["b", "b2"], "state": "untried", "pending": 0, "oldest_pending_at": None,
-             "last_success_at": None, "last_failure_at": None, "last_error": None, "consecutive_failures": 0},
+             "last_success_at": None, "last_failure_at": None, "last_error": None, "consecutive_failures": 0,
+             "retry_at": None},
         ])
 
     def test_a_failing_webhook_shows_its_queue_and_failures_until_it_recovers(self):
