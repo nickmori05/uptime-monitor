@@ -115,6 +115,18 @@ With the defaults, one success between failures keeps it open. Reports are
 rebuilt from saved checks in insertion order every time, so changing the
 thresholds reinterprets history without editing it.
 
+Checks are samples, so an incident's exact length is unknown, but its checks
+bound it. Each incident reports `min_downtime_seconds`, from its first failed
+check to its last (`last_failure_at`), and `max_downtime_seconds`, from the last
+success before it (`previous_success_at`) to the first check of the run of
+successes that resolved it (`recovery_started_at`). The real outage lies between
+the two. For example, with checks every 30 seconds, an incident with three failed
+checks reports 60 and 120. The longest is `null` while the incident is open, and
+when history starts with the failure. Successes inside an incident that weren't
+enough to resolve it count as part of it, as they do for `failed_checks`. If the
+clock is set back during an incident, a span that would be negative is reported
+as 0. Alerts carry the same fields in their `incident` object.
+
 `summary` reports, per URL, the latest result and the up/down counts and
 latency (successful checks only) over the last `--last` checks (default 100).
 `--state` filters by each URL's latest result. Both commands describe what was
@@ -287,14 +299,16 @@ python3 scripts/docker_smoke.py
 The unit tests use a temporary local HTTP server and temporary databases, with
 connection failures and hung lookups injected, so they need no network access.
 They cover checks and deadlines, targets, batches and their concurrency limit,
-the watcher and its signal handling, incidents, summaries, alerts, webhook
-delivery, catching up on missed alerts, skipping incidents that already
-resolved, routing alerts per target, and idempotency keys, the API, the
-dashboard's headers and policy, and upgrading older databases.
+the watcher and its signal handling, incidents and their downtime bounds,
+summaries, alerts, webhook delivery, catching up on missed alerts, skipping
+incidents that already resolved, routing alerts per target, and idempotency
+keys, the API, the dashboard's headers and policy, and upgrading older
+databases.
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
-network: non-root execution, persistence across containers, SIGTERM shutdown,
+network: non-root execution, persistence across containers, an incident's
+downtime bounds, SIGTERM shutdown,
 deadlines, webhook alerts sent once across restarts with matching keys in the
 header, body, and `alerts` log, the API and dashboard
 served from another container, an alert for an incident that opened while
@@ -339,8 +353,9 @@ same on every run; timings, and how many kills land and where, vary.
 
 - Every report and alert round rescans the matching history, so it suits
   local-sized databases rather than long-term storage at scale.
-- Observations are point-in-time samples; there are no uptime percentages or
-  exact outage durations.
+- Observations are point-in-time samples; there are no uptime percentages, and
+  outage durations are only known to lie between the incident's two bounds,
+  which are as coarse as the check interval.
 - The socket timeout alone doesn't bound DNS lookups; use a deadline for that.
 - Alert delivery is at least once: a watcher killed mid-delivery repeats that
   alert after restarting (2 of 22 alerts in the crash scenario above). The
@@ -362,7 +377,8 @@ same on every run; timings, and how many kills land and where, vary.
 ## Roadmap
 
 Earlier milestones (the API and dashboard, deduplicated alerts with measured
-reliability, and saved deadlines) are done. Next:
+reliability, saved deadlines, and downtime bounds for each incident) are done.
+Next:
 
 1. ~~Give every alert an idempotency key so receivers can drop repeats.~~ Done:
    `idempotency_key` and the `Idempotency-Key` header.
