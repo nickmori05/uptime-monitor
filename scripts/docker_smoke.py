@@ -43,6 +43,10 @@ def main():
         assert incident["state"] == "resolved", incident
         assert incident["failed_checks"] == 2, incident
         assert incident["resolution_check_id"] == batches[-1]["results"][0]["id"], incident
+        # History starts with the outage, so its start (and the longest it could have lasted) is unknown.
+        assert incident["previous_success_at"] is None and incident["max_downtime_seconds"] is None, incident
+        assert incident["min_downtime_seconds"] >= 1, incident
+        assert incident["recovery_started_at"] == batches[2]["results"][0]["checked_at"], incident
         assert len(json.loads(command("history"))) == 4
         summary, = json.loads(command("summary", "--url", "http://fixture:8000/service"))
         assert (summary["stored_checks"], summary["up_checks"], summary["down_checks"]) == (4, 2, 2), summary
