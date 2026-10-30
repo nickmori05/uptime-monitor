@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from incidents import list_incidents
 import routing
+from uptime import uptime_report
 
 DASHBOARD = Path(__file__).resolve().with_name("dashboard.html")
 
@@ -48,13 +49,25 @@ class Query:
 def routes(store) -> dict:
     # `store` is the monitor module, passed in so this file doesn't import it back.
     """Map each API path to its allowed parameters and handler."""
-    def summary(connection, query):
+    def chosen_url(connection, query):
         url, target = query.text("url"), query.text("target")
         if url is not None and target is not None:
             raise ValueError("Choose either url or target, not both.")
         if target is not None:
-            url = store.get_target(connection, target)["url"]
-        return store.summarize(connection, query.integer("last", 100), url, state=query.text("state"))
+            return store.get_target(connection, target)["url"]
+        return url
+
+    def summary(connection, query):
+        return store.summarize(connection, query.integer("last", 100), chosen_url(connection, query),
+                               state=query.text("state"))
+
+    def availability(connection, query):
+        url = chosen_url(connection, query)
+        return uptime_report(
+            connection, url=store.validate_url(url) if url is not None else None,
+            hours=query.integer("hours", 24), until=query.text("until"), max_gap=query.integer("max_gap", 300),
+            failures=query.integer("failures", 2), recoveries=query.integer("recoveries", 2),
+        )
 
     def incidents(connection, query):
         url = query.text("url")
@@ -71,6 +84,7 @@ def routes(store) -> dict:
             connection, query.integer("limit", 20), query.text("url"))),
         "/api/summary": (("url", "target", "last", "state"), summary),
         "/api/incidents": (("url", "state", "limit", "failures", "recoveries"), incidents),
+        "/api/uptime": (("url", "target", "hours", "until", "max_gap", "failures", "recoveries"), availability),
     }
 
 

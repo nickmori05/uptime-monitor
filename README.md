@@ -254,13 +254,16 @@ webhook that heard it open also hears it close.
 ```sh
 python3 monitor.py serve --port 8080
 curl http://127.0.0.1:8080/api/summary
+curl 'http://127.0.0.1:8080/api/uptime?target=example&hours=168'
 curl 'http://127.0.0.1:8080/api/history?limit=5&url=https%3A%2F%2Fexample.com'
 ```
 
 `serve` listens on `127.0.0.1:8080` (`--port 0` picks a free port). It answers
-GET requests for `/api/targets`, `/api/history`, `/api/summary`, and
-`/api/incidents`, which return the same JSON as the matching commands and accept
-their filters as query parameters (URLs must be percent-encoded). The one
+GET requests for `/api/targets`, `/api/history`, `/api/summary`,
+`/api/incidents`, and `/api/uptime`, which return the same JSON as the matching
+commands and accept their filters as query parameters (`max_gap` for
+`--max-gap`). URLs and `until` must be percent-encoded, since a bare `+` in a
+timezone reads as a space. The one
 difference is that `/api/targets` shows a target's own webhook only as
 `"webhook"`, since webhook URLs often carry a secret token. Invalid or
 unknown parameters return `400`, unknown paths `404`, and other methods `405`.
