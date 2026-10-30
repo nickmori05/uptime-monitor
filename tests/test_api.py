@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 
 import api
 import monitor
+import uptime
 
 
 class ApiTests(unittest.TestCase):
@@ -60,6 +61,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.get("/api/history?limit=2")[1], monitor.history(self.connection, 2))
         self.assertEqual(self.get("/api/summary")[1], monitor.summarize(self.connection))
         self.assertEqual(self.get("/api/incidents")[1], monitor.list_incidents(self.connection))
+        until = "2026-10-13T13:00:00+00:00"
+        self.assertEqual(self.get("/api/uptime?until=2026-10-13T13%3A00%3A00%2B00%3A00")[1],
+                         uptime.uptime_report(self.connection, until=until))
 
     def test_targets_show_their_own_webhook_only_as_webhook(self):
         monitor.add_target(self.connection, "home", "https://example.com",
@@ -84,9 +88,17 @@ class ApiTests(unittest.TestCase):
         _, rows, _ = self.get(f"/api/incidents?failures=1&state=open&url={encoded}")
         self.assertEqual([(row["url"], row["state"]) for row in rows],
                          [("https://example.com/search?q=a+b&page=2", "open")])
+        window = "hours=2&until=2026-10-13T13%3A00%3A00%2B00%3A00&max_gap=600"
+        for chosen in ("target=home", f"url={encoded}"):
+            with self.subTest(chosen=chosen):
+                _, rows, _ = self.get(f"/api/uptime?{window}&failures=1&{chosen}")
+                self.assertEqual(rows, uptime.uptime_report(
+                    self.connection, url="https://example.com/search?q=a+b&page=2", hours=2,
+                    until="2026-10-13T13:00:00+00:00", max_gap=600, failures=1))
+                self.assertEqual((rows[0]["window_seconds"], rows[0]["incidents"]), (7200.0, 1))
 
     def test_empty_database_returns_empty_lists(self):
-        for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents"):
+        for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents", "/api/uptime"):
             with self.subTest(path=path):
                 self.assertEqual(self.get(path)[:2], (200, []))
 
@@ -104,6 +116,13 @@ class ApiTests(unittest.TestCase):
             "/api/summary?target=missing": "Target 'missing' does not exist",
             "/api/incidents?failures=101": "Failures",
             "/api/incidents?url=": "http",
+            "/api/uptime?hours=0": "Hours",
+            "/api/uptime?hours=1.5": "hours must be a whole number",
+            "/api/uptime?max_gap=86401": "Max gap",
+            "/api/uptime?until=2026-10-13T13:00:00+00:00": "timezone",
+            "/api/uptime?url=https://example.com&target=home": "either url or target",
+            "/api/uptime?target=missing": "Target 'missing' does not exist",
+            "/api/uptime?url=ftp://example.com": "http",
         }
         for path, message in cases.items():
             with self.subTest(path=path):
@@ -124,7 +143,7 @@ class ApiTests(unittest.TestCase):
         self.save("down")
         before = self.database.read_bytes()
         with patch("monitor.probe") as probe, patch("monitor.save") as save:
-            for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents"):
+            for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents", "/api/uptime"):
                 self.assertEqual(self.get(path)[0], 200)
         probe.assert_not_called()
         save.assert_not_called()
