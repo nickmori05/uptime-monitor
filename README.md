@@ -70,13 +70,16 @@ python3 monitor.py add example https://example.com --timeout 3 --deadline 10
 python3 monitor.py update example --url https://example.com/health
 python3 monitor.py update example --no-deadline
 python3 monitor.py update example --alert-webhook https://hooks.example.com/team
+python3 monitor.py update example --objective 99.9
 python3 monitor.py run example
 python3 monitor.py targets
 python3 monitor.py remove example
 ```
 
-A target saves a URL, a timeout, an optional default deadline, and where its
-alerts go (see [Routing alerts per target](#routing-alerts-per-target)) under a
+A target saves a URL, a timeout, an optional default deadline, where its
+alerts go (see [Routing alerts per target](#routing-alerts-per-target)), and an
+optional uptime `--objective` (a percentage above 0 and below 100, cleared with
+`--no-objective`; see [Uptime](#uptime)) under a
 name (1–64 letters, digits, `-` or `_`, starting with a letter or digit). `add` and
 `update` never make a request. Removing or re-pointing a target keeps its past
 checks, which stay tied to the URL they were made against. A `--deadline` given
