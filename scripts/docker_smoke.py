@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
+from urllib.parse import quote
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +48,13 @@ def main():
         assert incident["previous_success_at"] is None and incident["max_downtime_seconds"] is None, incident
         assert incident["min_downtime_seconds"] >= 1, incident
         assert incident["recovery_started_at"] == batches[2]["results"][0]["checked_at"], incident
+        # Nothing was checked before the first round, so almost the whole hour could have been down.
+        until = batches[-1]["results"][0]["checked_at"]
+        availability, = json.loads(command("uptime", "--target", "service", "--hours", "1", "--until", until))
+        assert (availability["checks"], availability["incidents"]) == (4, 1), availability
+        assert availability["min_downtime_seconds"] == incident["min_downtime_seconds"], availability
+        assert 3500 < availability["unobserved_seconds"] < availability["max_downtime_seconds"], availability
+        assert availability["min_uptime_percent"] < 1 and 99 < availability["max_uptime_percent"] < 100, availability
         assert len(json.loads(command("history"))) == 4
         summary, = json.loads(command("summary", "--url", "http://fixture:8000/service"))
         assert (summary["stored_checks"], summary["up_checks"], summary["down_checks"]) == (4, 2, 2), summary
@@ -110,6 +118,8 @@ def main():
         served, = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/summary?target=service"]))
         assert (served["stored_checks"], served["latest_state"]) == (6, "up"), served
         assert json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/incidents"])) == [incident]
+        window = f"/uptime?target=service&hours=1&until={quote(until, safe='')}"
+        assert json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + window])) == [availability]
         page = run(["exec", "-T", "fixture", "python", "-c", fetch, f"http://{project}-api:8080/"])
         assert "<title>Uptime Monitor</title>" in page and "/api/summary" in page, page[:200]
         assert len(json.loads(command("history", "--limit", "100"))) == 7

@@ -343,7 +343,7 @@ databases.
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
 network: non-root execution, persistence across containers, an incident's
-downtime bounds, SIGTERM shutdown,
+downtime bounds and the uptime range they give, SIGTERM shutdown,
 deadlines, webhook alerts sent once across restarts with matching keys in the
 header, body, and `alerts` log, the API and dashboard
 served from another container, an alert for an incident that opened while
@@ -388,9 +388,11 @@ same on every run; timings, and how many kills land and where, vary.
 
 - Every report and alert round rescans the matching history, so it suits
   local-sized databases rather than long-term storage at scale.
-- Observations are point-in-time samples; there are no uptime percentages, and
-  outage durations are only known to lie between the incident's two bounds,
-  which are as coarse as the check interval.
+- Observations are point-in-time samples, so outage durations and uptime are
+  only known to lie between two bounds, which are as coarse as the check
+  interval. Uptime counts only incidents as downtime, so failures too brief to
+  open one (fewer than `--failures` in a row) don't lower it, and gaps longer
+  than `--max-gap` lower only the minimum.
 - The socket timeout alone doesn't bound DNS lookups; use a deadline for that.
 - Alert delivery is at least once: a watcher killed mid-delivery repeats that
   alert after restarting (2 of 22 alerts in the crash scenario above). The
