@@ -1,6 +1,7 @@
 """Rebuild incidents (runs of consecutive failures) from saved observations."""
 
 from contextlib import closing
+from datetime import datetime
 from heapq import nlargest
 import sqlite3
 
@@ -46,16 +47,46 @@ def scan_incidents(connection: sqlite3.Connection, *, url: str | None = None,
         return list(_episodes(rows, failures, recoveries))
 
 
+def seconds_between(start: str | None, end: str | None) -> float | None:
+    """Return the seconds from one saved timestamp to another, or None if either is missing or unreadable.
+
+    Checks are ordered by row ID, so a clock change can make a later check look
+    earlier; a negative span is reported as 0.
+    """
+    if start is None or end is None:
+        return None
+    try:
+        span = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    return round(max(span, 0.0), 3)
+
+
+def _bound(incident: dict) -> dict:
+    """Add the shortest and longest outage the incident's checks allow.
+
+    The outage covers at least the first to the last failed check. It began after
+    the last success before it and ended before the first check of the recovery,
+    so the longest is the span between those two, unknown while either is missing.
+    """
+    incident["min_downtime_seconds"] = seconds_between(incident["opened_at"], incident["last_failure_at"])
+    incident["max_downtime_seconds"] = seconds_between(incident["previous_success_at"],
+                                                       incident["recovery_started_at"])
+    return incident
+
+
 def _episodes(rows, failures: int, recoveries: int):
     pending = {}
     active = {}
     healthy = {}
+    last_up = {}
     for row in rows:
         url = row["url"]
         incident = active.get(url)
         if incident is None:
             if row["state"] == "up":
                 pending.pop(url, None)
+                last_up[url] = row["checked_at"]
                 continue
             first, count = pending.get(url, (row, 0))
             count += 1
@@ -74,6 +105,9 @@ def _episodes(rows, failures: int, recoveries: int):
                 "failed_checks": count,
                 "last_checked_at": row["checked_at"],
                 "last_check_id": row["id"],
+                "previous_success_at": last_up.get(url),
+                "last_failure_at": row["checked_at"],
+                "recovery_started_at": None,
             }
             active[url] = incident
             pending.pop(url, None)
@@ -83,15 +117,22 @@ def _episodes(rows, failures: int, recoveries: int):
         incident["last_check_id"] = row["id"]
         if row["state"] == "down":
             incident["failed_checks"] += 1
+            incident["last_failure_at"] = row["checked_at"]
+            incident["recovery_started_at"] = None
             healthy[url] = 0
         else:
             healthy[url] += 1
+            if healthy[url] == 1:
+                incident["recovery_started_at"] = row["checked_at"]
             if healthy[url] >= recoveries:
                 incident.update(
                     state="resolved", resolved_at=row["checked_at"],
                     resolution_check_id=row["id"],
                 )
-                yield incident
+                last_up[url] = row["checked_at"]
+                yield _bound(incident)
                 del active[url]
                 del healthy[url]
-    yield from active.values()
+    for incident in active.values():
+        # Still open: the outage hasn't ended, so the longest it could be is unknown.
+        yield _bound({**incident, "recovery_started_at": None})
