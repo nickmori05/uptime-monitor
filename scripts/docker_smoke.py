@@ -1,5 +1,6 @@
 """Build the image and check the watcher, alerts, API, and dashboard end to end with Docker Compose."""
 
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -179,6 +180,20 @@ def main():
         assert [(row["route"], row["host"], row["state"]) for row in json.loads(served)] == [
             ("default", None, "ok"), ("webhook", "fixture", "failing"), ("webhook", "fixture", "ok")], served
         print("Webhook health report passed.", flush=True)
+
+        # With --max-backoff the starting watcher tries the failing webhook once, then leaves it for
+        # two intervals (4 seconds), so neither of the two rounds inside that wait tries it again.
+        command("watch", "--interval", "2", "--count", "2", "--max-backoff", "60", expected=1)
+        broken, = [row for row in json.loads(command("webhooks"))
+                   if row["route"] == "http://fixture:8000/broken-webhook"]
+        assert (broken["consecutive_failures"], broken["pending"]) == (2, 1), broken
+        waited = (datetime.fromisoformat(broken["retry_at"]) - datetime.fromisoformat(broken["last_failure_at"]))
+        assert waited.total_seconds() == 4, broken
+        command("watch", "--interval", "1", "--count", "1", expected=1)
+        broken, = [row for row in json.loads(command("webhooks"))
+                   if row["route"] == "http://fixture:8000/broken-webhook"]
+        assert (broken["consecutive_failures"], broken["retry_at"]) == (4, None), broken
+        print("Webhook backoff passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)

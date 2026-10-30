@@ -119,7 +119,8 @@ async function refresh() {
       [webhook.pending ? `${webhook.pending} since ${when(webhook.oldest_pending_at)}` : "0"],
       [when(webhook.last_success_at), "", webhook.last_success_at],
       [webhook.last_failure_at ? `${when(webhook.last_failure_at)} (${webhook.last_error})` : "—", "",
-       webhook.consecutive_failures ? `${webhook.consecutive_failures} in a row` : ""],
+       webhook.consecutive_failures ? `${webhook.consecutive_failures} in a row` +
+         (webhook.retry_at ? `, next try after ${when(webhook.retry_at)}` : "") : ""],
     ], "No alert webhooks yet.");
     document.getElementById("status").textContent = `Updated ${new Date().toLocaleTimeString()}.`;
     document.getElementById("error").textContent = "";

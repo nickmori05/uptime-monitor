@@ -23,6 +23,7 @@ import alerts
 import api
 from incidents import list_incidents
 import routing
+import webhooks
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / ".local" / "checks.sqlite3"
 ALERT_WEBHOOK_COLUMN = ("TEXT NOT NULL DEFAULT 'default' CHECK(alert_webhook IN ('default', 'none') "
@@ -230,9 +231,13 @@ def connect(database: Path) -> sqlite3.Connection:
             last_success_at TEXT,
             last_failure_at TEXT,
             last_error TEXT,
-            failures INTEGER NOT NULL DEFAULT 0 CHECK(failures >= 0)
+            failures INTEGER NOT NULL DEFAULT 0 CHECK(failures >= 0),
+            retry_at TEXT
         )"""
     )
+    # Webhook health saved before backoff has no retry time, so every webhook is tried next round.
+    if "retry_at" not in {row["name"] for row in connection.execute("PRAGMA table_info(webhooks)")}:
+        connection.execute("ALTER TABLE webhooks ADD COLUMN retry_at TEXT")
     connection.commit()
     return connection
 
@@ -494,6 +499,8 @@ def parser() -> argparse.ArgumentParser:
                        help="POST incident openings and resolutions to this URL, unless a target sets its own")
     watch.add_argument("--skip-resolved", action="store_true",
                        help="Skip incidents that resolved before their opening was sent, sending neither event")
+    watch.add_argument("--max-backoff", type=float, metavar="SECONDS",
+                       help="Wait before retrying a failing webhook: one interval, doubling per failure up to this")
     alert_log = commands.add_parser("alerts", help="Show sent and skipped alerts as JSON")
     alert_log.add_argument("--limit", type=int, default=20, help="Alerts to show, 1–1000 (default: 20)")
     alert_log.add_argument("--pending", action="store_true",
@@ -533,10 +540,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         with closing(connect(args.database)) as connection:
             if args.command == "watch":
-                if args.skip_resolved and args.alert_webhook is None and not routing.has_webhooks(connection):
-                    raise ValueError("--skip-resolved only applies to alerts, so it needs --alert-webhook "
-                                     "or a target with its own webhook.")
-                alert = alerts.Alerter(connection, args.alert_webhook, skip_resolved=args.skip_resolved)
+                for option, given in (("--skip-resolved", args.skip_resolved),
+                                      ("--max-backoff", args.max_backoff is not None)):
+                    if given and args.alert_webhook is None and not routing.has_webhooks(connection):
+                        raise ValueError(f"{option} only applies to alerts, so it needs --alert-webhook "
+                                         "or a target with its own webhook.")
+                backoff = None
+                if args.max_backoff is not None:
+                    backoff = webhooks.Backoff(args.interval, args.max_backoff)
+                alert = alerts.Alerter(connection, args.alert_webhook, skip_resolved=args.skip_resolved,
+                                       backoff=backoff)
                 alert()
                 failed = False
                 for batch in watch_targets(connection, interval=args.interval, count=args.count,

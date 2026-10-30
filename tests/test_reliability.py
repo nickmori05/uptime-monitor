@@ -170,6 +170,39 @@ class RoutedDeliveryTests(unittest.TestCase):
                 self.assertGreater(report[measure], 0, report)
 
 
+class BackoffDeliveryTests(unittest.TestCase):
+    def test_backoff_spends_fewer_attempts_and_matches_the_model(self):
+        # At this size, seed 7's webhooks have outages long enough for the limit to matter.
+        plain = alert_delivery(seed=7, rounds=60, routed=True, outages=True)
+        backoff = alert_delivery(seed=7, rounds=60, routed=True, outages=True, max_backoff=60)
+        for report in (plain, backoff):
+            self.assertTrue(report["ok"], report)
+            self.assertEqual(report["attempts"], report["expected_attempts"], report)
+            self.assertEqual(report["delivered"], report["expected_alerts"], report)
+        self.assertLess(backoff["failed_attempts"], plain["failed_attempts"])
+
+    def test_ignoring_uncapping_or_holding_backoff_at_start_is_caught(self):
+        real_deliver = alerts.deliver
+
+        def held_at_start(*arguments, **options):
+            return real_deliver(*arguments, **{**options, "retry_now": False})
+
+        def uncapped(backoff, failures):
+            return backoff.first * 2 ** (failures - 1)
+
+        broken = {
+            "ignored": patch.object(webhooks, "backing_off", side_effect=lambda _connection: set()),
+            "uncapped": patch.object(webhooks.Backoff, "delay", uncapped),
+            "held at start": patch.object(alerts, "deliver", side_effect=held_at_start),
+        }
+        for name, fault in broken.items():
+            with self.subTest(fault=name), fault:
+                report = alert_delivery(seed=7, rounds=60, routed=True, outages=True, max_backoff=60)
+                self.assertFalse(report["ok"])
+                self.assertTrue(report["attempts"] != report["expected_attempts"] or report["not_at_first_chance"],
+                                report)
+
+
 class WebhookHealthTests(unittest.TestCase):
     def test_the_report_matches_what_each_receiver_saw(self):
         report = alert_delivery(seed=8, rounds=30, routed=True)
@@ -180,9 +213,10 @@ class WebhookHealthTests(unittest.TestCase):
         real_note = webhooks.note
 
         def only(outcome):
-            def note(connection, route, error):
+            def note(connection, route, error, *backoff):
                 if (error is None) == (outcome == "successes"):
-                    real_note(connection, route, error)
+                    return real_note(connection, route, error, *backoff)
+                return None
             return note
 
         for kept in ("successes", "failures"):
