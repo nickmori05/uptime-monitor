@@ -23,7 +23,7 @@ class TargetTests(unittest.TestCase):
         self.addCleanup(reopened.close)
         self.assertEqual(monitor.get_target(reopened, "api-health"), {
             "name": "api-health", "url": "https://example.com/health", "timeout": 2.5, "deadline": None,
-            "alert_webhook": "default"})
+            "alert_webhook": "default", "objective": None})
 
     def test_duplicate_name_does_not_replace_configuration(self):
         original = monitor.add_target(self.connection, "api", "https://example.com")
@@ -48,7 +48,7 @@ class TargetTests(unittest.TestCase):
                     code = monitor.main(["--database", str(self.database), "update", "api", *flags])
                 self.assertEqual(code, 0)
                 expected = {"name": "api", "url": expected_url, "timeout": expected_timeout, "deadline": None,
-                            "alert_webhook": "default"}
+                            "alert_webhook": "default", "objective": None}
                 self.assertEqual(json.loads(output.getvalue()), expected)
                 reopened = monitor.connect(self.database)
                 try:

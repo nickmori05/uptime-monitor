@@ -60,8 +60,8 @@ for headers. A check that passes its deadline is saved as `down` with the error
 `deadline_exceeded`. Both accept more than 0 and at most 60 seconds.
 
 Exit codes are shared by all commands: `0` success (or an `up` check), `1` a
-`down` check, `2` invalid input or a storage error, `130` Ctrl+C, and `143`
-SIGTERM.
+`down` check (or a missed uptime objective), `2` invalid input or a storage
+error, `130` Ctrl+C, and `143` SIGTERM.
 
 ### Targets
 
@@ -70,13 +70,16 @@ python3 monitor.py add example https://example.com --timeout 3 --deadline 10
 python3 monitor.py update example --url https://example.com/health
 python3 monitor.py update example --no-deadline
 python3 monitor.py update example --alert-webhook https://hooks.example.com/team
+python3 monitor.py update example --objective 99.9
 python3 monitor.py run example
 python3 monitor.py targets
 python3 monitor.py remove example
 ```
 
-A target saves a URL, a timeout, an optional default deadline, and where its
-alerts go (see [Routing alerts per target](#routing-alerts-per-target)) under a
+A target saves a URL, a timeout, an optional default deadline, where its
+alerts go (see [Routing alerts per target](#routing-alerts-per-target)), and an
+optional uptime `--objective` (a percentage above 0 and below 100, cleared with
+`--no-objective`; see [Uptime](#uptime)) under a
 name (1–64 letters, digits, `-` or `_`, starting with a letter or digit). `add` and
 `update` never make a request. Removing or re-pointing a target keeps its past
 checks, which stay tied to the URL they were made against. A `--deadline` given
@@ -139,6 +142,7 @@ unknown.
 python3 monitor.py uptime
 python3 monitor.py uptime --target example --hours 168
 python3 monitor.py uptime --until 2026-10-27T00:00:00+00:00 --hours 24 --max-gap 120
+python3 monitor.py uptime --hours 720 --status missed
 ```
 
 `uptime` turns incidents into an uptime range for each URL over a window of
@@ -162,6 +166,24 @@ inside, and `--failures` and `--recoveries` work as they do for `incidents`.
 The report lists URLs with a check or an incident in the window, sorted by URL,
 along with `checks` and `incidents` counts for the window. `--url` or `--target`
 reports one URL even if nothing is known about it, which gives 0 to 100%.
+
+#### Uptime objectives
+
+A target's `--objective` (for example `99.9`) sets the uptime its URL should
+reach, and `uptime` judges each URL against it. `budget_seconds` is the downtime
+the objective allows in the window (86.4 seconds a day at 99.9%), and
+`min_budget_left_seconds` and `max_budget_left_seconds` subtract the longest
+and shortest downtime from it, going negative once it's spent.
+`objective_status` is `met` if even the longest downtime fits the budget,
+`missed` if even the shortest doesn't, and `uncertain` in between, when only
+the time nobody checked (or the time just around an incident) decides it. A URL
+checked by several targets uses the strictest of their objectives, and a URL
+with none has these fields set to `null`.
+
+`--objective` on `uptime` judges every reported URL against that value instead,
+and `--status met|uncertain|missed` keeps only URLs with that status. `uptime`
+exits `1` when any URL it reports missed its objective, so a scheduled job can
+fail on it; `uncertain` doesn't count.
 
 ### Alerts
 
@@ -262,7 +284,7 @@ curl 'http://127.0.0.1:8080/api/history?limit=5&url=https%3A%2F%2Fexample.com'
 GET requests for `/api/targets`, `/api/history`, `/api/summary`,
 `/api/incidents`, and `/api/uptime`, which return the same JSON as the matching
 commands and accept their filters as query parameters (`max_gap` for
-`--max-gap`). URLs and `until` must be percent-encoded, since a bare `+` in a
+`--max-gap`, and `objective` as a plain decimal). URLs and `until` must be percent-encoded, since a bare `+` in a
 timezone reads as a space. The one
 difference is that `/api/targets` shows a target's own webhook only as
 `"webhook"`, since webhook URLs often carry a secret token. Invalid or
@@ -343,7 +365,8 @@ databases.
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
 network: non-root execution, persistence across containers, an incident's
-downtime bounds and the uptime range they give, SIGTERM shutdown,
+downtime bounds and the uptime range they give, judged against an objective,
+SIGTERM shutdown,
 deadlines, webhook alerts sent once across restarts with matching keys in the
 header, body, and `alerts` log, the API and dashboard
 served from another container, an alert for an incident that opened while
@@ -392,7 +415,11 @@ same on every run; timings, and how many kills land and where, vary.
   only known to lie between two bounds, which are as coarse as the check
   interval. Uptime counts only incidents as downtime, so failures too brief to
   open one (fewer than `--failures` in a row) don't lower it, and gaps longer
-  than `--max-gap` lower only the minimum.
+  than `--max-gap` lower only the minimum. An objective judged on a window with
+  long unchecked stretches is usually `uncertain`.
+- Objectives are judged over the window asked for, not a rolling calendar
+  period, and nothing alerts when a budget runs low; a scheduled `uptime` that
+  fails on exit `1` is the way to notice.
 - The socket timeout alone doesn't bound DNS lookups; use a deadline for that.
 - Alert delivery is at least once: a watcher killed mid-delivery repeats that
   alert after restarting (2 of 22 alerts in the crash scenario above). The

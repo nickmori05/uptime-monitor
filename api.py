@@ -45,6 +45,14 @@ class Query:
             raise ValueError(f"{name} must be a whole number.")
         return int(value)
 
+    def number(self, name: str) -> float | None:
+        value = self.values.get(name)
+        if value is None:
+            return None
+        if not re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,6})?", value):
+            raise ValueError(f"{name} must be a decimal number.")
+        return float(value)
+
 
 def routes(store) -> dict:
     # `store` is the monitor module, passed in so this file doesn't import it back.
@@ -67,6 +75,7 @@ def routes(store) -> dict:
             connection, url=store.validate_url(url) if url is not None else None,
             hours=query.integer("hours", 24), until=query.text("until"), max_gap=query.integer("max_gap", 300),
             failures=query.integer("failures", 2), recoveries=query.integer("recoveries", 2),
+            objective=query.number("objective"), status=query.text("status"),
         )
 
     def incidents(connection, query):
@@ -84,7 +93,8 @@ def routes(store) -> dict:
             connection, query.integer("limit", 20), query.text("url"))),
         "/api/summary": (("url", "target", "last", "state"), summary),
         "/api/incidents": (("url", "state", "limit", "failures", "recoveries"), incidents),
-        "/api/uptime": (("url", "target", "hours", "until", "max_gap", "failures", "recoveries"), availability),
+        "/api/uptime": (("url", "target", "hours", "until", "max_gap", "failures", "recoveries", "objective",
+                         "status"), availability),
     }
 
 
