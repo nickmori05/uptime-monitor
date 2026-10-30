@@ -38,7 +38,7 @@ options.
 | `add`, `update`, `remove`, `targets` | Manage named targets with saved settings. |
 | `run NAME`, `run-all` | Check one or every saved target once. |
 | `watch` | Check every saved target in repeated rounds, optionally sending alerts. |
-| `history`, `summary`, `incidents`, `alerts` | Report on saved results without making requests. |
+| `history`, `summary`, `incidents`, `uptime`, `alerts` | Report on saved results without making requests. |
 | `serve` | Serve the read-only JSON API and dashboard. |
 
 ### Checks
@@ -132,6 +132,36 @@ latency (successful checks only) over the last `--last` checks (default 100).
 `--state` filters by each URL's latest result. Both commands describe what was
 observed, not live health or an uptime percentage; gaps between checks are
 unknown.
+
+### Uptime
+
+```sh
+python3 monitor.py uptime
+python3 monitor.py uptime --target example --hours 168
+python3 monitor.py uptime --until 2026-10-27T00:00:00+00:00 --hours 24 --max-gap 120
+```
+
+`uptime` turns incidents into an uptime range for each URL over a window of
+`--hours` (default 24, at most a year) ending `--until` (an ISO 8601 time with a
+timezone; default now). Like the incident bounds, it's a range because checks
+are samples: `min_downtime_seconds` counts only the time between each
+incident's first and last failed check, and `max_downtime_seconds` counts from
+the last success before each incident to the start of its recovery. From those,
+`min_uptime_percent` and `max_uptime_percent` bracket the real figure. Both are
+rounded down to three decimals, so possible downtime never shows as 100%.
+
+Time nobody checked can't be called up. Any stretch where a URL's checks were
+more than `--max-gap` seconds apart (default 300), and the time before its first
+check, is reported as `unobserved_seconds` and counts toward the longest
+downtime but not the shortest. So does the time after its last check, so a URL
+that stopped being checked has a falling minimum. Set `--max-gap` above the
+watcher's interval plus its deadline. Overlapping spans are counted once, an
+incident that started before the window or is still open counts only its part
+inside, and `--failures` and `--recoveries` work as they do for `incidents`.
+
+The report lists URLs with a check or an incident in the window, sorted by URL,
+along with `checks` and `incidents` counts for the window. `--url` or `--target`
+reports one URL even if nothing is known about it, which gives 0 to 100%.
 
 ### Alerts
 
@@ -267,6 +297,8 @@ container itself. To send alerts, add `--alert-webhook URL` to the service
 - `monitor.py`: the command line, request probing, SQLite storage, targets,
   batches, and the watcher.
 - `incidents.py`: rebuilds incidents from saved checks.
+- `uptime.py`: bounds each URL's uptime over a window from its incidents and
+  the gaps between its checks.
 - `alerts.py`: finds unsent incident events and delivers them to webhooks.
 - `routing.py`: works out which webhooks each URL's alerts go to.
 - `api.py` and `dashboard.html`: the read-only HTTP API and the static dashboard.

@@ -2,6 +2,7 @@
 !Dockerfile
 !monitor.py
 !incidents.py
+!uptime.py
 !api.py
 !alerts.py
 !routing.py

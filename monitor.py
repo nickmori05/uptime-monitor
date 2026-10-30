@@ -23,6 +23,7 @@ import alerts
 import api
 from incidents import list_incidents
 import routing
+import uptime
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / ".local" / "checks.sqlite3"
 ALERT_WEBHOOK_COLUMN = ("TEXT NOT NULL DEFAULT 'default' CHECK(alert_webhook IN ('default', 'none') "
@@ -496,6 +497,17 @@ def parser() -> argparse.ArgumentParser:
     incidents.add_argument("--limit", type=int, default=20, help="Incidents to show, 1–1000 (default: 20)")
     incidents.add_argument("--failures", type=int, default=2, help="Consecutive failures to open an incident")
     incidents.add_argument("--recoveries", type=int, default=2, help="Consecutive successes to resolve it")
+    availability = commands.add_parser("uptime", help="Bound each URL's downtime and uptime over a recent window")
+    availability_target = availability.add_mutually_exclusive_group()
+    availability_target.add_argument("--url", type=url_argument, help="Only report this exact URL")
+    availability_target.add_argument("--target", help="Report the URL currently saved for this target name")
+    availability.add_argument("--hours", type=int, default=24, help="Window length in hours, 1–8784 (default: 24)")
+    availability.add_argument("--until", metavar="TIMESTAMP",
+                              help="End the window at this ISO 8601 time with a timezone (default: now)")
+    availability.add_argument("--max-gap", type=int, default=300,
+                              help="Seconds between checks after which the time between is unobserved (default: 300)")
+    availability.add_argument("--failures", type=int, default=2, help="Consecutive failures to open an incident")
+    availability.add_argument("--recoveries", type=int, default=2, help="Consecutive successes to resolve it")
     serve = commands.add_parser("serve", help="Serve a dashboard and read-only JSON API for saved results")
     serve.add_argument("--host", default="127.0.0.1", help="Address to listen on (default: 127.0.0.1)")
     serve.add_argument("--port", type=int, default=8080, help="Port to listen on, 0 for any free port (default: 8080)")
@@ -545,6 +557,12 @@ def main(argv: list[str] | None = None) -> int:
                     failures=args.failures, recoveries=args.recoveries,
                 )
                 print(json.dumps(results, indent=2))
+                return 0
+            if args.command == "uptime":
+                url = get_target(connection, args.target)["url"] if args.target is not None else args.url
+                print(json.dumps(uptime.uptime_report(
+                    connection, url=url, hours=args.hours, until=args.until, max_gap=args.max_gap,
+                    failures=args.failures, recoveries=args.recoveries), indent=2))
                 return 0
             if args.command == "history":
                 print(json.dumps(history(connection, args.limit, args.url), indent=2))
