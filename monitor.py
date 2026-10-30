@@ -223,6 +223,16 @@ def connect(database: Path) -> sqlite3.Connection:
             UNIQUE(first_failure_id, event, route)
         )"""
     )
+    # One row per webhook route that was ever tried, with its latest outcomes, for the `webhooks` report.
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS webhooks (
+            route TEXT PRIMARY KEY,
+            last_success_at TEXT,
+            last_failure_at TEXT,
+            last_error TEXT,
+            failures INTEGER NOT NULL DEFAULT 0 CHECK(failures >= 0)
+        )"""
+    )
     connection.commit()
     return connection
 
@@ -490,6 +500,7 @@ def parser() -> argparse.ArgumentParser:
                            help="Show events the next alerting watcher will send instead, oldest first")
     alert_log.add_argument("--skip-resolved", action="store_true",
                            help="With --pending, leave out incidents a watcher with --skip-resolved would skip")
+    commands.add_parser("webhooks", help="Show each alert webhook's last success, last failure, and queued alerts")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=url_argument, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"), help="Only report open or resolved incidents")
@@ -538,6 +549,9 @@ def main(argv: list[str] | None = None) -> int:
                 listed = alerts.list_alerts(connection, args.limit, pending=args.pending,
                                             skip_resolved=args.skip_resolved)
                 print(json.dumps(listed, indent=2))
+                return 0
+            if args.command == "webhooks":
+                print(json.dumps(alerts.webhook_health(connection), indent=2))
                 return 0
             if args.command == "incidents":
                 results = list_incidents(

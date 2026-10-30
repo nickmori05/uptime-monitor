@@ -11,9 +11,10 @@ class Endpoint(BaseHTTPRequestHandler):
     alerts = []
 
     def do_POST(self):
+        # Read the body before refusing an unknown path, so the client sees the 404 rather than a reset.
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if self.path not in ("/webhook", "/team-webhook"):
             return self.reply(404)
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         # Keep the header and path beside the body so the smoke test can check them.
         Endpoint.alerts.append({**body, "header_key": self.headers.get("Idempotency-Key"), "path": self.path})
         self.reply(204)

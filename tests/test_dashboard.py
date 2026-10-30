@@ -65,7 +65,7 @@ class DashboardTests(unittest.TestCase):
         monitor.save(self.connection, monitor.Check(
             "https://example.com", "2026-10-15T12:00:00+00:00", "down", None, 3000.0, "timeout"))
         paths = re.findall(r'"(/api/[^"]*)"', self.page)
-        self.assertEqual(len(paths), 3, paths)
+        self.assertEqual(len(paths), 4, paths)
         for path in paths:
             with self.subTest(path=path):
                 self.assertEqual(fetch(self.base_url + path)[0], 200)
