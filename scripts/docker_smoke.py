@@ -50,11 +50,18 @@ def main():
         assert incident["recovery_started_at"] == batches[2]["results"][0]["checked_at"], incident
         # Nothing was checked before the first round, so almost the whole hour could have been down.
         until = batches[-1]["results"][0]["checked_at"]
+        command("update", "service", "--objective", "99")
         availability, = json.loads(command("uptime", "--target", "service", "--hours", "1", "--until", until))
         assert (availability["checks"], availability["incidents"]) == (4, 1), availability
         assert availability["min_downtime_seconds"] == incident["min_downtime_seconds"], availability
         assert 3500 < availability["unobserved_seconds"] < availability["max_downtime_seconds"], availability
         assert availability["min_uptime_percent"] < 1 and 99 < availability["max_uptime_percent"] < 100, availability
+        # The unchecked hour could have spent the 36-second budget, but the incident alone didn't.
+        assert (availability["objective_percent"], availability["budget_seconds"]) == (99, 36), availability
+        assert availability["objective_status"] == "uncertain", availability
+        strict, = json.loads(command("uptime", "--target", "service", "--hours", "1", "--until", until,
+                                     "--objective", "99.99", expected=1))
+        assert strict["objective_status"] == "missed" and strict["max_budget_left_seconds"] < 0, strict
         assert len(json.loads(command("history"))) == 4
         summary, = json.loads(command("summary", "--url", "http://fixture:8000/service"))
         assert (summary["stored_checks"], summary["up_checks"], summary["down_checks"]) == (4, 2, 2), summary

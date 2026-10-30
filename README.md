@@ -60,8 +60,8 @@ for headers. A check that passes its deadline is saved as `down` with the error
 `deadline_exceeded`. Both accept more than 0 and at most 60 seconds.
 
 Exit codes are shared by all commands: `0` success (or an `up` check), `1` a
-`down` check, `2` invalid input or a storage error, `130` Ctrl+C, and `143`
-SIGTERM.
+`down` check (or a missed uptime objective), `2` invalid input or a storage
+error, `130` Ctrl+C, and `143` SIGTERM.
 
 ### Targets
 
@@ -365,7 +365,8 @@ databases.
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
 network: non-root execution, persistence across containers, an incident's
-downtime bounds and the uptime range they give, SIGTERM shutdown,
+downtime bounds and the uptime range they give, judged against an objective,
+SIGTERM shutdown,
 deadlines, webhook alerts sent once across restarts with matching keys in the
 header, body, and `alerts` log, the API and dashboard
 served from another container, an alert for an incident that opened while
@@ -414,7 +415,11 @@ same on every run; timings, and how many kills land and where, vary.
   only known to lie between two bounds, which are as coarse as the check
   interval. Uptime counts only incidents as downtime, so failures too brief to
   open one (fewer than `--failures` in a row) don't lower it, and gaps longer
-  than `--max-gap` lower only the minimum.
+  than `--max-gap` lower only the minimum. An objective judged on a window with
+  long unchecked stretches is usually `uncertain`.
+- Objectives are judged over the window asked for, not a rolling calendar
+  period, and nothing alerts when a budget runs low; a scheduled `uptime` that
+  fails on exit `1` is the way to notice.
 - The socket timeout alone doesn't bound DNS lookups; use a deadline for that.
 - Alert delivery is at least once: a watcher killed mid-delivery repeats that
   alert after restarting (2 of 22 alerts in the crash scenario above). The
