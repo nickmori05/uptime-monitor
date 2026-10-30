@@ -536,6 +536,10 @@ def parser() -> argparse.ArgumentParser:
                               help="Seconds between checks after which the time between is unobserved (default: 300)")
     availability.add_argument("--failures", type=int, default=2, help="Consecutive failures to open an incident")
     availability.add_argument("--recoveries", type=int, default=2, help="Consecutive successes to resolve it")
+    availability.add_argument("--objective", type=float, metavar="PERCENT",
+                              help="Judge every URL against this objective instead of its targets' saved ones")
+    availability.add_argument("--status", choices=uptime.STATUSES,
+                              help="Only report URLs whose objective has this status")
     serve = commands.add_parser("serve", help="Serve a dashboard and read-only JSON API for saved results")
     serve.add_argument("--host", default="127.0.0.1", help="Address to listen on (default: 127.0.0.1)")
     serve.add_argument("--port", type=int, default=8080, help="Port to listen on, 0 for any free port (default: 8080)")
@@ -588,10 +592,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "uptime":
                 url = get_target(connection, args.target)["url"] if args.target is not None else args.url
-                print(json.dumps(uptime.uptime_report(
+                report = uptime.uptime_report(
                     connection, url=url, hours=args.hours, until=args.until, max_gap=args.max_gap,
-                    failures=args.failures, recoveries=args.recoveries), indent=2))
-                return 0
+                    failures=args.failures, recoveries=args.recoveries, objective=args.objective,
+                    status=args.status)
+                print(json.dumps(report, indent=2))
+                return 1 if any(row["objective_status"] == "missed" for row in report) else 0
             if args.command == "history":
                 print(json.dumps(history(connection, args.limit, args.url), indent=2))
                 return 0

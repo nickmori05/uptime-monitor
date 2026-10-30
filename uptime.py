@@ -9,6 +9,7 @@ from incidents import scan_incidents
 
 MAX_HOURS = 24 * 366
 MAX_GAP_SECONDS = 86_400
+STATUSES = ("met", "uncertain", "missed")
 
 
 def parse_time(value: str | None) -> datetime | None:
@@ -66,7 +67,7 @@ def unobserved(times: list[datetime], start: datetime, end: datetime,
 
 def uptime_report(connection: sqlite3.Connection, *, url: str | None = None, hours: int = 24,
                   until: str | None = None, max_gap: int = 300, failures: int = 2,
-                  recoveries: int = 2) -> list[dict]:
+                  recoveries: int = 2, objective: float | None = None, status: str | None = None) -> list[dict]:
     """Report the shortest and longest each URL could have been down in a window, and the uptime that leaves.
 
     Only incidents count as downtime, using the same thresholds as `incidents`.
@@ -75,10 +76,19 @@ def uptime_report(connection: sqlite3.Connection, *, url: str | None = None, hou
     before each incident to the start of its recovery, and every stretch with
     no check for more than `max_gap` seconds, since the URL could have been
     down then without anyone seeing.
+
+    Each URL is judged against `objective` if given, else the strictest
+    objective saved on the targets that check it (see `judge`), and `status`
+    keeps only URLs whose objective has that status.
     """
     for name, value, maximum in (("Hours", hours, MAX_HOURS), ("Max gap", max_gap, MAX_GAP_SECONDS)):
         if type(value) is not int or not 1 <= value <= maximum:
             raise ValueError(f"{name} must be between 1 and {maximum}.")
+    if objective is not None and (isinstance(objective, bool) or not math.isfinite(objective)
+                                  or not 0 < objective < 100):
+        raise ValueError("Objective must be a percentage greater than 0 and less than 100.")
+    if status not in (None, *STATUSES):
+        raise ValueError("Status must be met, uncertain, or missed.")
     end = window_end(until)
     start = end - timedelta(hours=hours)
     window = (end - start).total_seconds()
@@ -107,6 +117,7 @@ def uptime_report(connection: sqlite3.Connection, *, url: str | None = None, hou
         counted[key] = counted.get(key, 0) + 1
         shortest.setdefault(key, []).append((opened, last_failure))
         longest.setdefault(key, []).append((min(began, opened), max(ended, last_failure)))
+    saved = objectives(connection)
     report = []
     for key in sorted(times):
         checks = times[key]
@@ -128,8 +139,37 @@ def uptime_report(connection: sqlite3.Connection, *, url: str | None = None, hou
             "max_downtime_seconds": round(most, 3),
             "min_uptime_percent": percent(window - most, window),
             "max_uptime_percent": percent(window - least, window),
+            **judge(objective if objective is not None else saved.get(key), window, least, most),
         })
-    return report
+    return [row for row in report if status is None or row["objective_status"] == status]
+
+
+def objectives(connection: sqlite3.Connection) -> dict[str, float]:
+    """Map each URL to the strictest uptime objective saved on the targets that check it."""
+    rows = connection.execute("SELECT url, MAX(objective) AS objective FROM targets "
+                              "WHERE objective IS NOT NULL GROUP BY url")
+    return {row["url"]: row["objective"] for row in rows}
+
+
+def judge(objective: float | None, window: float, least: float, most: float) -> dict:
+    """Compare a window's downtime bounds with an uptime objective's error budget.
+
+    The budget is the downtime the objective allows in the window. The objective
+    was `met` if even the longest downtime fits in it, `missed` if even the
+    shortest doesn't, and `uncertain` in between, when only the checks nobody
+    made could tell. A URL with no objective has every field `None`.
+    """
+    if objective is None:
+        return dict.fromkeys(("objective_percent", "budget_seconds", "min_budget_left_seconds",
+                              "max_budget_left_seconds", "objective_status"))
+    budget = window * (100 - objective) / 100
+    return {
+        "objective_percent": objective,
+        "budget_seconds": round(budget, 3),
+        "min_budget_left_seconds": round(budget - most, 3),
+        "max_budget_left_seconds": round(budget - least, 3),
+        "objective_status": "met" if most <= budget else "missed" if least > budget else "uncertain",
+    }
 
 
 def percent(part: float, whole: float) -> float:

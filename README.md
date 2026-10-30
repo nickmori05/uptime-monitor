@@ -142,6 +142,7 @@ unknown.
 python3 monitor.py uptime
 python3 monitor.py uptime --target example --hours 168
 python3 monitor.py uptime --until 2026-10-27T00:00:00+00:00 --hours 24 --max-gap 120
+python3 monitor.py uptime --hours 720 --status missed
 ```
 
 `uptime` turns incidents into an uptime range for each URL over a window of
@@ -165,6 +166,24 @@ inside, and `--failures` and `--recoveries` work as they do for `incidents`.
 The report lists URLs with a check or an incident in the window, sorted by URL,
 along with `checks` and `incidents` counts for the window. `--url` or `--target`
 reports one URL even if nothing is known about it, which gives 0 to 100%.
+
+#### Uptime objectives
+
+A target's `--objective` (for example `99.9`) sets the uptime its URL should
+reach, and `uptime` judges each URL against it. `budget_seconds` is the downtime
+the objective allows in the window (86.4 seconds a day at 99.9%), and
+`min_budget_left_seconds` and `max_budget_left_seconds` subtract the longest
+and shortest downtime from it, going negative once it's spent.
+`objective_status` is `met` if even the longest downtime fits the budget,
+`missed` if even the shortest doesn't, and `uncertain` in between, when only
+the time nobody checked (or the time just around an incident) decides it. A URL
+checked by several targets uses the strictest of their objectives, and a URL
+with none has these fields set to `null`.
+
+`--objective` on `uptime` judges every reported URL against that value instead,
+and `--status met|uncertain|missed` keeps only URLs with that status. `uptime`
+exits `1` when any URL it reports missed its objective, so a scheduled job can
+fail on it; `uncertain` doesn't count.
 
 ### Alerts
 
@@ -265,7 +284,7 @@ curl 'http://127.0.0.1:8080/api/history?limit=5&url=https%3A%2F%2Fexample.com'
 GET requests for `/api/targets`, `/api/history`, `/api/summary`,
 `/api/incidents`, and `/api/uptime`, which return the same JSON as the matching
 commands and accept their filters as query parameters (`max_gap` for
-`--max-gap`). URLs and `until` must be percent-encoded, since a bare `+` in a
+`--max-gap`, and `objective` as a plain decimal). URLs and `until` must be percent-encoded, since a bare `+` in a
 timezone reads as a space. The one
 difference is that `/api/targets` shows a target's own webhook only as
 `"webhook"`, since webhook URLs often carry a secret token. Invalid or
