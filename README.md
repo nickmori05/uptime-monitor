@@ -107,6 +107,7 @@ python3 monitor.py incidents --state open
 python3 monitor.py incidents --failures 3 --recoveries 2 --limit 10
 python3 monitor.py summary --target example --last 50
 python3 monitor.py summary --state down
+python3 monitor.py summary --slow-ms 500
 ```
 
 An incident opens after `--failures` consecutive failed checks of the same URL
@@ -134,7 +135,9 @@ and 99th percentiles (`up_p50_latency_ms` and so on). Percentiles use the
 nearest rank: the p95 is the smallest latency that at least 95% of the sampled
 successes were at or below, so it is always a latency that was actually
 measured. With fewer than 100 successes the p99 is the maximum, and with fewer
-than 20 so is the p95.
+than 20 so is the p95. `--slow-ms MS` (1–60,000) adds `slow_checks`, the number
+of sampled successes that took at least that long; it is `null` without the
+option, and `/api/summary` takes it as `slow_ms`. Slow checks still count as up.
 `--state` filters by each URL's latest result. Both commands describe what was
 observed, not live health or an uptime percentage; gaps between checks are
 unknown.
