@@ -25,6 +25,7 @@ from incidents import list_incidents
 import routing
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / ".local" / "checks.sqlite3"
+LATENCY_PERCENTILES = (50, 95, 99)
 ALERT_WEBHOOK_COLUMN = ("TEXT NOT NULL DEFAULT 'default' CHECK(alert_webhook IN ('default', 'none') "
                         "OR alert_webhook LIKE 'http://%' OR alert_webhook LIKE 'https://%')")
 
@@ -257,21 +258,32 @@ def history(connection: sqlite3.Connection, limit: int = 20, url: str | None = N
 
 
 def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None = None,
-              *, state: str | None = None) -> list[dict]:
-    """Summarize the most recent `last` observations for each URL."""
+              *, state: str | None = None, slow_ms: int | None = None) -> list[dict]:
+    """Summarize the most recent `last` observations for each URL, counting successes at or over `slow_ms`."""
     if type(last) is not int or not 1 <= last <= 10000:
         raise ValueError("Summary sample size must be between 1 and 10000.")
+    if slow_ms is not None and (type(slow_ms) is not int or not 1 <= slow_ms <= 60000):
+        raise ValueError("Slow threshold must be a whole number of milliseconds between 1 and 60000.")
     if state is not None and state not in ("up", "down"):
         raise ValueError("Summary state must be up or down.")
     if url is not None:
         url = validate_url(url)
     where = " WHERE url = ?" if url is not None else ""
-    values = (url, last) if url is not None else (last,)
+    values = ((url,) if url is not None else ()) + (last, slow_ms, slow_ms)
+    # Percentiles use the nearest rank over the sample's successful checks: the smallest latency that at
+    # least p% of them are at or below, so every value reported is one that was actually observed.
+    percentiles = "".join(
+        f",\n               MAX(CASE WHEN state = 'up' AND latency_rank = ({p} * up_sampled + 99) / 100 "
+        f"THEN latency_ms END) AS up_p{p}_latency_ms" for p in LATENCY_PERCENTILES)
     rows = connection.execute(
         """WITH ranked AS (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY url ORDER BY id DESC) AS position,
                    COUNT(*) OVER (PARTITION BY url) AS stored_checks
             FROM checks""" + where + """
+        ), sampled AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY url, state ORDER BY latency_ms, id) AS latency_rank,
+                   SUM(state = 'up') OVER (PARTITION BY url) AS up_sampled
+            FROM ranked WHERE position <= ?
         )
         SELECT url, MAX(stored_checks) AS stored_checks, COUNT(*) AS sampled_checks,
                SUM(state = 'up') AS up_checks, SUM(state = 'down') AS down_checks,
@@ -282,8 +294,9 @@ def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None =
                MAX(CASE WHEN position = 1 THEN status_code END) AS latest_status_code,
                ROUND(AVG(CASE WHEN state = 'up' THEN latency_ms END), 3) AS up_avg_latency_ms,
                MIN(CASE WHEN state = 'up' THEN latency_ms END) AS up_min_latency_ms,
-               MAX(CASE WHEN state = 'up' THEN latency_ms END) AS up_max_latency_ms
-        FROM ranked WHERE position <= ? GROUP BY url ORDER BY url""", values,
+               MAX(CASE WHEN state = 'up' THEN latency_ms END) AS up_max_latency_ms""" + percentiles + """,
+               CASE WHEN ? IS NOT NULL THEN SUM(state = 'up' AND latency_ms >= ?) END AS slow_checks
+        FROM sampled GROUP BY url ORDER BY url""", values,
     ).fetchall()
     return [dict(row) for row in rows if state is None or row["latest_state"] == state]
 
@@ -451,6 +464,8 @@ def parser() -> argparse.ArgumentParser:
     summary_target.add_argument("--target", help="Summarize the URL currently saved for this target name")
     summary.add_argument("--state", choices=("up", "down"),
                          help="Only include endpoints whose latest saved check has this state")
+    summary.add_argument("--slow-ms", type=int, metavar="MS",
+                         help="Count successful checks that took at least this many milliseconds, 1–60000")
     add = commands.add_parser("add", help="Save a named target without making a request")
     add.add_argument("name")
     add.add_argument("url")
@@ -551,7 +566,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "summary":
                 url = get_target(connection, args.target)["url"] if args.target is not None else args.url
-                print(json.dumps(summarize(connection, args.last, url, state=args.state), indent=2))
+                rows = summarize(connection, args.last, url, state=args.state, slow_ms=args.slow_ms)
+                print(json.dumps(rows, indent=2))
                 return 0
             if args.command == "add":
                 target = add_target(connection, args.name, args.url, args.timeout, args.deadline, args.alert_webhook)

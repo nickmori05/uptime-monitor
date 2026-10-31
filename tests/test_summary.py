@@ -1,7 +1,9 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import math
 from pathlib import Path
+import random
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -33,6 +35,7 @@ class SummaryTests(unittest.TestCase):
             'latest_checked_at': '2026-09-27T12:00:00+00:00', 'latest_state': 'down',
             'latest_error': 'timeout', 'latest_status_code': None,
             'up_avg_latency_ms': 20, 'up_min_latency_ms': 10, 'up_max_latency_ms': 30,
+            'up_p50_latency_ms': 10, 'up_p95_latency_ms': 30, 'up_p99_latency_ms': 30, 'slow_checks': None,
         })
 
     def test_sample_is_per_url_and_uses_record_order_even_if_clock_moves_back(self):
@@ -54,8 +57,81 @@ class SummaryTests(unittest.TestCase):
         row, = monitor.summarize(self.connection)
         self.assertEqual(row['up_checks'], 0)
         self.assertEqual(row['down_checks'], 1)
-        for key in ('up_avg_latency_ms', 'up_min_latency_ms', 'up_max_latency_ms'):
+        for key in ('up_avg_latency_ms', 'up_min_latency_ms', 'up_max_latency_ms',
+                    'up_p50_latency_ms', 'up_p95_latency_ms', 'up_p99_latency_ms'):
             self.assertIsNone(row[key])
+
+    def test_percentiles_use_nearest_rank_over_successful_checks(self):
+        for latency in range(100, 0, -1):
+            self.save(latency=latency)
+        self.save(state='down', latency=1)
+        self.save(state='down', latency=9000)
+        row, = monitor.summarize(self.connection, last=1000)
+        self.assertEqual((row['up_checks'], row['down_checks']), (100, 2))
+        # With 100 successes the nth percentile is the nth smallest, and failures never count.
+        self.assertEqual((row['up_p50_latency_ms'], row['up_p95_latency_ms'], row['up_p99_latency_ms']), (50, 95, 99))
+        self.assertEqual(row['up_max_latency_ms'], 100)
+        self.save(latency=0.5)
+        row, = monitor.summarize(self.connection, last=1000)
+        # 101 successes: ranks 51, 96, and 100 (rounded up), shifted by the new fastest check.
+        self.assertEqual((row['up_p50_latency_ms'], row['up_p95_latency_ms'], row['up_p99_latency_ms']), (50, 95, 99))
+        self.save(latency=1000)
+        row, = monitor.summarize(self.connection, last=1000)
+        self.assertEqual((row['up_p50_latency_ms'], row['up_p95_latency_ms'], row['up_p99_latency_ms']),
+                         (50, 96, 100))
+
+    def test_percentiles_cover_only_the_sample_and_each_url(self):
+        self.save(latency=5000)
+        for latency in (10, 20, 30):
+            self.save(latency=latency)
+        self.save(latency=7, url='https://other.example')
+        rows = monitor.summarize(self.connection, last=3)
+        self.assertEqual([(row['up_p50_latency_ms'], row['up_p99_latency_ms']) for row in rows], [(20, 30), (7, 7)])
+        row, = monitor.summarize(self.connection, last=4, url='https://example.com')
+        self.assertEqual(row['up_p99_latency_ms'], 5000)
+
+    def test_percentiles_match_a_sorted_list_for_random_histories(self):
+        generator = random.Random(7)
+        urls = [f'https://{name}.example' for name in ('a', 'b', 'c', 'd')]
+        saved = {url: [] for url in urls}
+        for _ in range(600):
+            url = generator.choice(urls)
+            state = 'up' if generator.random() < 0.8 else 'down'
+            # Few distinct values, so ties are common.
+            latency = generator.choice((generator.randint(1, 20), round(generator.uniform(0, 400), 3)))
+            self.save(state=state, latency=latency, url=url)
+            saved[url].append((state, latency))
+        for last in (1, 2, 7, 50, 1000):
+            for row in monitor.summarize(self.connection, last=last):
+                successes = sorted(latency for state, latency in saved[row['url']][-last:] if state == 'up')
+                for percentile in monitor.LATENCY_PERCENTILES:
+                    with self.subTest(last=last, url=row['url'], percentile=percentile):
+                        expected = successes[math.ceil(percentile / 100 * len(successes)) - 1] if successes else None
+                        self.assertEqual(row[f'up_p{percentile}_latency_ms'], expected)
+
+    def test_slow_checks_count_sampled_successes_at_or_over_the_threshold(self):
+        for latency in (5000, 99.999, 100, 250):
+            self.save(latency=latency)
+        self.save(state='down', latency=9000)
+        self.save(latency=150, url='https://other.example')
+        rows = monitor.summarize(self.connection, last=4, slow_ms=100)
+        # The 5,000 ms check is outside the sample and the failure is down, not slow.
+        self.assertEqual([row['slow_checks'] for row in rows], [2, 1])
+        self.assertEqual(monitor.summarize(self.connection, slow_ms=101)[0]['slow_checks'], 2)
+        self.assertEqual(monitor.summarize(self.connection, slow_ms=60000)[0]['slow_checks'], 0)
+        self.assertEqual([row['slow_checks'] for row in monitor.summarize(self.connection)], [None, None])
+        self.save(state='down', url='https://down.example')
+        row, = monitor.summarize(self.connection, url='https://down.example', slow_ms=1)
+        self.assertEqual(row['slow_checks'], 0)
+
+    def test_slow_threshold_combines_with_url_and_state_filters(self):
+        self.save(latency=500)
+        self.save(latency=500, url='https://other.example')
+        self.save(state='down', url='https://other.example')
+        row, = monitor.summarize(self.connection, url='https://other.example', slow_ms=200)
+        self.assertEqual(row['slow_checks'], 1)
+        row, = monitor.summarize(self.connection, state='down', slow_ms=200)
+        self.assertEqual((row['url'], row['slow_checks']), ('https://other.example', 1))
 
     def test_latest_success_does_not_reuse_previous_error(self):
         self.save(state='down')
@@ -92,6 +168,9 @@ class SummaryTests(unittest.TestCase):
             monitor.summarize(self.connection, url='file:///etc/hosts')
         with self.assertRaisesRegex(ValueError, 'Summary state'):
             monitor.summarize(self.connection, state='unknown')
+        for slow in (0, -1, 60001, True, 1.5, '100'):
+            with self.subTest(slow=slow), self.assertRaisesRegex(ValueError, 'Slow threshold'):
+                monitor.summarize(self.connection, slow_ms=slow)
 
     def test_state_filter_uses_latest_result_without_removing_other_samples(self):
         self.save(state='up')
@@ -150,6 +229,21 @@ class SummaryTests(unittest.TestCase):
         row, = json.loads(output.getvalue())
         self.assertEqual(row['url'], 'https://new.example')
         self.assertEqual((row['sampled_checks'], row['down_checks']), (1, 1))
+
+    def test_cli_slow_threshold_counts_slow_successes_and_rejects_bad_values(self):
+        self.save(latency=40)
+        self.save(latency=900)
+        args = ['--database', str(self.database), 'summary']
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(monitor.main(args + ['--slow-ms', '500']), 0)
+        row, = json.loads(output.getvalue())
+        self.assertEqual((row['slow_checks'], row['up_p50_latency_ms'], row['up_p99_latency_ms']), (1, 40, 900))
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(monitor.main(args + ['--slow-ms', '0']), 2)
+        self.assertEqual(output.getvalue(), '')
+        self.assertIn('Slow threshold', errors.getvalue())
 
     def test_cli_missing_target_reports_error_and_url_target_conflict_is_rejected(self):
         args = ['--database', str(self.database), 'summary', '--target', 'missing']

@@ -70,6 +70,19 @@ class ApiTests(unittest.TestCase):
         self.assertEqual([(target["name"], target["alert_webhook"]) for target in targets],
                          [("home", "webhook"), ("quiet", "none")])
 
+    def test_summary_slow_threshold_matches_the_command_and_rejects_bad_values(self):
+        self.save("up")
+        status, rows, _ = self.get("/api/summary?slow_ms=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(rows, monitor.summarize(self.connection, slow_ms=1))
+        self.assertEqual(rows[0]["slow_checks"], 1)
+        self.assertIsNone(self.get("/api/summary")[1][0]["slow_checks"])
+        for value in ("0", "60001", "fast", "1.5"):
+            with self.subTest(value=value):
+                status, body, _ = self.get(f"/api/summary?slow_ms={value}")
+                self.assertEqual(status, 400)
+                self.assertRegex(body["error"], "Slow threshold|slow_ms must be a whole number")
+
     def test_filters_match_the_command_line_options(self):
         monitor.add_target(self.connection, "home", "https://example.com/search?q=a+b&page=2")
         self.save("down", url="https://example.com/search?q=a+b&page=2")
