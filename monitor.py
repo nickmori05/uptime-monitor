@@ -25,6 +25,7 @@ from incidents import list_incidents
 import routing
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / ".local" / "checks.sqlite3"
+LATENCY_PERCENTILES = (50, 95, 99)
 ALERT_WEBHOOK_COLUMN = ("TEXT NOT NULL DEFAULT 'default' CHECK(alert_webhook IN ('default', 'none') "
                         "OR alert_webhook LIKE 'http://%' OR alert_webhook LIKE 'https://%')")
 
@@ -267,11 +268,20 @@ def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None =
         url = validate_url(url)
     where = " WHERE url = ?" if url is not None else ""
     values = (url, last) if url is not None else (last,)
+    # Percentiles use the nearest rank over the sample's successful checks: the smallest latency that at
+    # least p% of them are at or below, so every value reported is one that was actually observed.
+    percentiles = "".join(
+        f",\n               MAX(CASE WHEN state = 'up' AND latency_rank = ({p} * up_sampled + 99) / 100 "
+        f"THEN latency_ms END) AS up_p{p}_latency_ms" for p in LATENCY_PERCENTILES)
     rows = connection.execute(
         """WITH ranked AS (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY url ORDER BY id DESC) AS position,
                    COUNT(*) OVER (PARTITION BY url) AS stored_checks
             FROM checks""" + where + """
+        ), sampled AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY url, state ORDER BY latency_ms, id) AS latency_rank,
+                   SUM(state = 'up') OVER (PARTITION BY url) AS up_sampled
+            FROM ranked WHERE position <= ?
         )
         SELECT url, MAX(stored_checks) AS stored_checks, COUNT(*) AS sampled_checks,
                SUM(state = 'up') AS up_checks, SUM(state = 'down') AS down_checks,
@@ -282,8 +292,8 @@ def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None =
                MAX(CASE WHEN position = 1 THEN status_code END) AS latest_status_code,
                ROUND(AVG(CASE WHEN state = 'up' THEN latency_ms END), 3) AS up_avg_latency_ms,
                MIN(CASE WHEN state = 'up' THEN latency_ms END) AS up_min_latency_ms,
-               MAX(CASE WHEN state = 'up' THEN latency_ms END) AS up_max_latency_ms
-        FROM ranked WHERE position <= ? GROUP BY url ORDER BY url""", values,
+               MAX(CASE WHEN state = 'up' THEN latency_ms END) AS up_max_latency_ms""" + percentiles + """
+        FROM sampled GROUP BY url ORDER BY url""", values,
     ).fetchall()
     return [dict(row) for row in rows if state is None or row["latest_state"] == state]
 

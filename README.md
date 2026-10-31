@@ -129,6 +129,12 @@ as 0. Alerts carry the same fields in their `incident` object.
 
 `summary` reports, per URL, the latest result and the up/down counts and
 latency (successful checks only) over the last `--last` checks (default 100).
+Latency is given as the average, minimum, and maximum, and as the 50th, 95th,
+and 99th percentiles (`up_p50_latency_ms` and so on). Percentiles use the
+nearest rank: the p95 is the smallest latency that at least 95% of the sampled
+successes were at or below, so it is always a latency that was actually
+measured. With fewer than 100 successes the p99 is the maximum, and with fewer
+than 20 so is the p95.
 `--state` filters by each URL's latest result. Both commands describe what was
 observed, not live health or an uptime percentage; gaps between checks are
 unknown.
