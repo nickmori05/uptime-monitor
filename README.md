@@ -40,6 +40,7 @@ options.
 | `watch` | Check every saved target in repeated rounds, optionally sending alerts. |
 | `history`, `summary`, `incidents`, `alerts` | Report on saved results without making requests. |
 | `serve` | Serve the read-only JSON API and dashboard. |
+| `prune` | Delete old checks without changing later incidents or alerts. |
 
 ### Checks
 
@@ -243,6 +244,41 @@ only as text, and is served with a strict Content Security Policy.
 There is no authentication or TLS. Keep the loopback default unless the network
 is trusted, because anyone who can reach the port can read every saved URL.
 
+### Pruning old checks
+
+```sh
+python3 monitor.py prune --keep-days 90
+```
+
+Every check is kept until you prune, and every report rescans them. `prune`
+deletes each URL's checks from before the last `--keep-days` days (1–36,500),
+and reports how many it deleted per URL. It never makes a request.
+
+Incidents are rebuilt from checks, so cutting history at an arbitrary point
+could split one, change its first failed check (and with it the alert's
+idempotency key), or lose the success that bounds the next one's downtime.
+Instead each URL keeps everything from its last success before the cutoff that
+isn't inside an incident, under the default thresholds alerts use. Every
+incident left is then rebuilt exactly as before, with the same IDs, bounds, and
+keys. That means:
+
+- A check newer than the cutoff is never deleted, nor anything after it, even if
+  the clock was set back. Checks with unreadable timestamps count as new.
+- An incident still open at the cutoff keeps all its checks and the success
+  before it, so a URL that has been down for months keeps those months.
+- Once alerting has been enabled, an incident with an alert still owed (pending
+  or failing) keeps its checks until the alert is sent or skipped.
+- An incident's `alerts` records are deleted with its checks, since the incident
+  can't come back. Records of incidents that remain keep their keys.
+
+`prune` plans and deletes in one write transaction, so a watcher on the same
+file can't save a check or send an alert in between. The watcher waits for the
+prune up to SQLite's 5-second busy timeout, and exits with `2` if it takes longer
+(pruning 113,000 of 200,000 checks took 0.4 seconds on a laptop). Nothing
+prunes automatically, so run it from cron or a scheduled job. SQLite reuses the
+freed space rather than shrinking the file; to shrink it, run
+`sqlite3 FILE 'VACUUM'` while nothing else has the file open.
+
 ### Docker
 
 ```sh
@@ -270,6 +306,7 @@ container itself. To send alerts, add `--alert-webhook URL` to the service
 - `alerts.py`: finds unsent incident events and delivers them to webhooks.
 - `routing.py`: works out which webhooks each URL's alerts go to.
 - `api.py` and `dashboard.html`: the read-only HTTP API and the static dashboard.
+- `retention.py`: deletes old checks at points that leave later incidents unchanged.
 
 All state lives in one SQLite file with five tables: `checks` (one row per
 observation), `targets`, `alerts` (one row per sent or skipped incident event,

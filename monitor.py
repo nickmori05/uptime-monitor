@@ -22,6 +22,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 import alerts
 import api
 from incidents import list_incidents
+import retention
 import routing
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / ".local" / "checks.sqlite3"
@@ -469,6 +470,8 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("targets", help="List saved targets")
     remove = commands.add_parser("remove", help="Remove a saved target without deleting its history")
     remove.add_argument("name")
+    prune = commands.add_parser("prune", help="Delete old checks, keeping what later incidents and alerts need")
+    prune.add_argument("--keep-days", type=int, required=True, help="Days of checks to keep, 1–36500")
     run = commands.add_parser("run", help="Check one saved target and record the result")
     run.add_argument("name")
     run.add_argument("--deadline", type=float, help="Override the target's saved deadline for this run")
@@ -568,6 +571,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "remove":
                 print(json.dumps(remove_target(connection, args.name), indent=2))
+                return 0
+            if args.command == "prune":
+                print(json.dumps(retention.prune(connection, args.keep_days), indent=2))
                 return 0
             if args.command == "run-all":
                 results = run_targets(connection, args.workers, args.deadline)
