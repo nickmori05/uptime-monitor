@@ -61,8 +61,9 @@ class PruneTests(unittest.TestCase):
         ids = self.record([(10, "up"), (20, "up"), (50, "up"), (80, "up"), (90, "up")])
         report = self.prune(30)
         # The cutoff is day 70, so the success on day 50 is kept as the start of what remains.
-        self.assertEqual(report, {"cutoff": day(70), "deleted_checks": 2, "deleted_alerts": 0, "urls": [
-            {"url": URL, "deleted_checks": 2, "kept_from_id": ids[2], "kept_from_at": day(50)}]})
+        self.assertEqual(report, {"cutoff": day(70), "dry_run": False, "deleted_checks": 2, "deleted_alerts": 0,
+                                  "urls": [{"url": URL, "deleted_checks": 2, "kept_from_id": ids[2],
+                                            "kept_from_at": day(50)}], "held": []})
         self.assertEqual(self.ids(), ids[2:])
         self.assertFalse(self.connection.in_transaction)
         self.assertEqual(self.prune(30)["urls"], [])
@@ -83,6 +84,8 @@ class PruneTests(unittest.TestCase):
         self.assertEqual(self.ids(), ids[1:])
         self.assertEqual(scan_incidents(self.connection), before)
         self.assertEqual(before[0]["previous_success_at"], day(20))
+        self.assertEqual(report["held"], [{"url": URL, "reason": "open_at_cutoff", "first_failure_id": ids[2],
+                                           "opened_at": day(30)}])
 
     def test_a_resolved_incident_is_deleted_whole_or_not_at_all(self):
         ids = self.record([(10, "up"), (20, "down"), (30, "down"), (40, "up"), (50, "down"), (55, "up"),
@@ -94,6 +97,29 @@ class PruneTests(unittest.TestCase):
         later, = scan_incidents(self.connection)
         self.assertEqual(later, next(incident for incident in before if incident["first_failure_id"] == ids[8]))
         self.assertEqual(later["previous_success_at"], day(65))
+
+    def test_only_incidents_that_began_before_the_cutoff_are_held(self):
+        self.deliver()
+        self.record([(10, "up"), (60, "up"), (69, "down"), (71, "down"), (72, "up"), (73, "up")])
+        self.record([(10, "up"), (60, "up"), (75, "down"), (80, "down")], "https://late.example")
+        self.deliver()
+        report = self.prune(30)
+        # The first URL's incident spans the cutoff; the second's began after it, so it holds nothing back.
+        self.assertEqual([(hold["url"], hold["reason"]) for hold in report["held"]], [(URL, "open_at_cutoff")])
+        self.assertEqual([cut["url"] for cut in report["urls"]], ["https://example.com", "https://late.example"])
+
+    def test_a_dry_run_reports_the_same_without_deleting(self):
+        self.deliver()
+        self.record([(10, "up"), (20, "down"), (30, "down"), (40, "up"), (50, "up"), (60, "up")])
+        self.deliver()
+        before = [dict(row) for row in self.connection.execute("SELECT * FROM checks")]
+        logged = alerts.list_alerts(self.connection)
+        preview = retention.prune(self.connection, 30, now=NOW, dry_run=True)
+        self.assertEqual((preview["dry_run"], preview["deleted_checks"], preview["deleted_alerts"]), (True, 5, 2))
+        self.assertFalse(self.connection.in_transaction)
+        self.assertEqual([dict(row) for row in self.connection.execute("SELECT * FROM checks")], before)
+        self.assertEqual(alerts.list_alerts(self.connection), logged)
+        self.assertEqual({**self.prune(30), "dry_run": True}, preview)
 
     def test_a_clock_set_back_never_deletes_a_check_from_inside_the_window(self):
         ids = self.record([(10, "up"), (80, "up"), (20, "up"), (90, "up")])
@@ -121,11 +147,15 @@ class PruneTests(unittest.TestCase):
         self.deliver(["http_500"])
         owed = alerts.unsent_alerts(self.connection)
         self.assertEqual(len(owed), 2)
-        self.assertEqual(self.prune(30)["urls"], [])
+        report = self.prune(30)
+        self.assertEqual(report["urls"], [])
+        self.assertEqual(report["held"], [{"url": URL, "reason": "unsent_alert", "first_failure_id": ids[1],
+                                           "opened_at": day(20)}])
         self.assertEqual(self.ids(), ids)
         self.assertEqual(alerts.unsent_alerts(self.connection), owed)
         self.assertEqual(len(self.deliver()), 2)
-        self.assertEqual(self.prune(30)["urls"][0]["kept_from_id"], ids[5])
+        report = self.prune(30)
+        self.assertEqual((report["urls"][0]["kept_from_id"], report["held"]), (ids[5], []))
 
     def test_events_from_before_alerting_was_enabled_hold_nothing(self):
         ids = self.record([(10, "up"), (20, "down"), (30, "down"), (40, "up"), (50, "up"), (60, "up")])
@@ -146,11 +176,13 @@ class PruneTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         old = (now - timedelta(days=40)).isoformat()
         ids = self.record([(old, "up"), (old, "up"), (now.isoformat(), "up")])
-        output = io.StringIO()
-        with redirect_stdout(output):
-            self.assertEqual(monitor.main(["--database", str(self.database), "prune", "--keep-days", "30"]), 0)
-        self.assertEqual(json.loads(output.getvalue())["deleted_checks"], 1)
-        self.assertEqual(self.ids(), ids[1:])
+        for flags, kept in ((["--dry-run"], ids), ([], ids[1:])):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = monitor.main(["--database", str(self.database), "prune", "--keep-days", "30", *flags])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output.getvalue())["deleted_checks"], 1)
+            self.assertEqual(self.ids(), kept)
         with redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(monitor.main(["--database", str(self.database), "prune", "--keep-days", "0"]), 2)
         self.assertIn("between 1 and 36500", errors.getvalue())
@@ -196,7 +228,9 @@ class PruneTests(unittest.TestCase):
         unsent = alerts.unsent_alerts(pruned)
         checks_before = [dict(row) for row in pruned.execute("SELECT * FROM checks ORDER BY id")]
         keep_days = rng.randrange(1, max(int(moment * 0.8), 2))
+        preview = retention.prune(pruned, keep_days, now=START + timedelta(days=moment), dry_run=True)
         report = retention.prune(pruned, keep_days, now=START + timedelta(days=moment))
+        self.assertEqual({**report, "dry_run": True}, preview)
         cutoff = datetime.fromisoformat(report["cutoff"])
         kept = {row["id"] for row in pruned.execute("SELECT id FROM checks")}
         self.assertEqual(len(checks_before) - len(kept), report["deleted_checks"])
@@ -224,8 +258,8 @@ class PruneTests(unittest.TestCase):
 
 
     def test_an_empty_database_has_nothing_to_prune(self):
-        self.assertEqual(self.prune(1), {"cutoff": (NOW - timedelta(days=1)).isoformat(), "deleted_checks": 0,
-                                         "deleted_alerts": 0, "urls": []})
+        self.assertEqual(self.prune(1), {"cutoff": (NOW - timedelta(days=1)).isoformat(), "dry_run": False,
+                                         "deleted_checks": 0, "deleted_alerts": 0, "urls": [], "held": []})
 
     def test_a_failure_part_way_deletes_nothing(self):
         for url in (URL, "https://b.example"):

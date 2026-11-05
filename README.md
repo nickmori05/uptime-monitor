@@ -247,12 +247,14 @@ is trusted, because anyone who can reach the port can read every saved URL.
 ### Pruning old checks
 
 ```sh
+python3 monitor.py prune --keep-days 90 --dry-run
 python3 monitor.py prune --keep-days 90
 ```
 
 Every check is kept until you prune, and every report rescans them. `prune`
 deletes each URL's checks from before the last `--keep-days` days (1–36,500),
 and reports how many it deleted per URL. It never makes a request.
+`--dry-run` reports the same without deleting anything.
 
 Incidents are rebuilt from checks, so cutting history at an arbitrary point
 could split one, change its first failed check (and with it the alert's
@@ -270,6 +272,10 @@ keys. That means:
   or failing) keeps its checks until the alert is sent or skipped.
 - An incident's `alerts` records are deleted with its checks, since the incident
   can't come back. Records of incidents that remain keep their keys.
+
+The report's `held` list names each incident that kept a URL's older checks,
+with its first failure and a `reason`: `open_at_cutoff` (it hadn't resolved by
+the cutoff) or `unsent_alert` (an alert for it is still owed).
 
 `prune` plans and deletes in one write transaction, so a watcher on the same
 file can't save a check or send an alert in between. The watcher waits for the
