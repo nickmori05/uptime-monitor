@@ -255,8 +255,9 @@ docker compose run --rm monitor incidents --state open
 
 The `monitor` service runs `watch --interval 30 --deadline 20` as a non-root
 user with a read-only filesystem, no capabilities, and no published ports. The
-database lives in the `monitor-data` volume, which survives `docker compose
-down` but not `down --volumes`. Add targets before starting it; the watcher exits
+database lives in the `monitor-data` volume, with its `-wal` and `-shm` files
+beside it. The volume survives `docker compose down` but not `down --volumes`.
+Add targets before starting it; the watcher exits
 when none remain. Compose allows 75 seconds for SIGTERM shutdown, which the
 20-second deadline stays well inside. Inside the container, `localhost` is the
 container itself. To send alerts, add `--alert-webhook URL` to the service
@@ -286,7 +287,12 @@ write, which keeps SQLite on one connection. Deadlines (and webhook deliveries)
 run the request on a daemon thread that is abandoned when time runs out, since
 a hung DNS lookup can't be cancelled; the abandoned thread finishes on its own
 socket timeout. The API opens the database read-only for each request, so it
-can run beside a watcher on the same file.
+can run beside a watcher on the same file. The file is in WAL mode, so that
+read does not block the watcher from committing a check, and a commit does not
+block the read. `synchronous` stays `FULL`. A checkpoint can still take a brief
+exclusive lock; a connection waits up to 5 seconds for it. An older database
+switches to WAL the next time a command opens it, and that switch needs the
+file to itself.
 
 ## Testing
 
@@ -302,8 +308,8 @@ They cover checks and deadlines, targets, batches and their concurrency limit,
 the watcher and its signal handling, incidents and their downtime bounds,
 summaries, alerts, webhook delivery, catching up on missed alerts, skipping
 incidents that already resolved, routing alerts per target, and idempotency
-keys, the API, the dashboard's headers and policy, and upgrading older
-databases.
+keys, the API, the dashboard's headers and policy, upgrading older
+databases, and reading the database while a check is committed.
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
@@ -373,6 +379,13 @@ same on every run; timings, and how many kills land and where, vary.
 - Per-target webhooks are stored in plain text in the database, like every
   other setting; anyone who can read the file can read their tokens.
 - The API and dashboard have no authentication, TLS, or write access.
+- Copying the `.sqlite3` file while a process has it open can omit the newest
+  checks: they sit in the `-wal` file until a checkpoint. Copy that file as
+  well, or copy the main file after every connection has closed, which
+  checkpoints and removes the `-wal` file. A copy of only the main file still
+  opens and passes `integrity_check`, so it looks complete when rows are
+  missing. Every process that opens the database, including the API, needs a
+  writable directory beside it for the `-shm` file.
 
 ## Roadmap
 
