@@ -158,10 +158,17 @@ def probe(url: str, timeout: float = 5.0, deadline: float | None = None) -> Chec
 
 
 def connect(database: Path) -> sqlite3.Connection:
-    """Open the database, creating or upgrading its tables as needed."""
+    """Open the database, creating or upgrading its tables, in WAL mode."""
     database.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database)
+    # Wait out a checkpoint's brief lock. WAL lets a reader (the API, or a report
+    # in another process) run while a check is committed, and the other way around.
+    # synchronous=FULL is SQLite's durable default; WAL does not relax it.
+    connection = sqlite3.connect(database, timeout=5.0)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA synchronous=FULL")
+    mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    if mode != "wal":
+        raise sqlite3.OperationalError(f"Could not enable WAL journaling (journal_mode is {mode}).")
     connection.execute(
         """CREATE TABLE IF NOT EXISTS checks (
             id INTEGER PRIMARY KEY,

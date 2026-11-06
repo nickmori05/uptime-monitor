@@ -90,6 +90,9 @@ class KeyTests(unittest.TestCase):
 
     def test_a_copied_database_keeps_the_same_keys(self):
         self.record(["down", "down"])
+        # A committed check can sit in the WAL until a checkpoint. Copy the main
+        # file only once that checkpoint has moved the rows into it.
+        self.assertEqual(self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0], 0)
         copy = self.database.with_name("copy.sqlite3")
         shutil.copy(self.database, copy)
         restored = monitor.connect(copy)
