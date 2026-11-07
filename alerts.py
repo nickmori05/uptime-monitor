@@ -12,6 +12,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from incidents import scan_incidents
 import routing
+import webhooks
 
 WEBHOOK_TIMEOUT = 5.0
 WEBHOOK_DEADLINE = 10.0
@@ -249,6 +250,7 @@ def deliver(connection: sqlite3.Connection, webhook: str | None, *, skip_resolve
             if route in reached or route in stopped or (route == routing.DEFAULT and webhook is None):
                 continue
             error = send_webhook(webhook if route == routing.DEFAULT else route, body)
+            webhooks.note(connection, route, error)
             where = routing.describe(route)
             if error is not None:
                 print(f"Alert not delivered ({error}){where}; retrying next round.", file=sys.stderr, flush=True)
@@ -280,6 +282,11 @@ class Alerter:
             return []
         self.started = True
         return start(self.connection, self.webhook, skip_resolved=self.skip_resolved)
+
+
+def webhook_health(connection: sqlite3.Connection) -> list[dict]:
+    """Report each webhook's last success, last failure, and the alerts queued for it."""
+    return webhooks.report(connection, unsent_alerts(connection))
 
 
 def list_alerts(connection: sqlite3.Connection, limit: int = 20, *, pending: bool = False,

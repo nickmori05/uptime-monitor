@@ -12,6 +12,7 @@ from incidents import scan_incidents
 import monitor
 import routing
 from scenarios import alert_delivery, oracle, probe_faults
+import webhooks
 
 
 class OracleTests(unittest.TestCase):
@@ -167,6 +168,28 @@ class RoutedDeliveryTests(unittest.TestCase):
                 report = alert_delivery(seed=8, rounds=30, routed=True)
                 self.assertFalse(report["ok"])
                 self.assertGreater(report[measure], 0, report)
+
+
+class WebhookHealthTests(unittest.TestCase):
+    def test_the_report_matches_what_each_receiver_saw(self):
+        report = alert_delivery(seed=8, rounds=30, routed=True)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["health_mismatches"], [])
+
+    def test_a_report_that_misses_attempts_is_caught(self):
+        real_note = webhooks.note
+
+        def only(outcome):
+            def note(connection, route, error):
+                if (error is None) == (outcome == "successes"):
+                    real_note(connection, route, error)
+            return note
+
+        for kept in ("successes", "failures"):
+            with self.subTest(kept=kept), patch.object(webhooks, "note", side_effect=only(kept)):
+                report = alert_delivery(seed=8, rounds=30, routed=True)
+                self.assertFalse(report["ok"])
+                self.assertTrue(report["health_mismatches"], report)
 
 
 class CrashTests(unittest.TestCase):

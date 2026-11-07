@@ -39,6 +39,12 @@ td.url { overflow-wrap: anywhere; min-width: 14em; }
 <tbody id="incidents"></tbody>
 </table></div>
 
+<h2>Alert webhooks</h2>
+<div class="wide"><table>
+<thead><tr><th>Webhook</th><th>Targets</th><th>State</th><th>Queued</th><th>Last success</th><th>Last failure</th></tr></thead>
+<tbody id="webhooks"></tbody>
+</table></div>
+
 <p class="note">Saved observations from the last 100 checks per URL, refreshed every 30 seconds.
 They describe past checks, not whether an endpoint is up right now.</p>
 
@@ -84,8 +90,8 @@ function latest(summary) {
 
 async function refresh() {
   try {
-    const [targets, summaries, incidents] = await Promise.all(
-      ["/api/targets", "/api/summary", "/api/incidents?state=open&limit=100"].map(load));
+    const [targets, summaries, incidents, webhooks] = await Promise.all(
+      ["/api/targets", "/api/summary", "/api/incidents?state=open&limit=100", "/api/webhooks"].map(load));
     const byUrl = new Map(summaries.map((summary) => [summary.url, { summary, names: [] }]));
     for (const target of targets) {
       if (!byUrl.has(target.url)) byUrl.set(target.url, { summary: null, names: [] });
@@ -106,6 +112,15 @@ async function refresh() {
       [String(incident.failed_checks)],
       [when(incident.last_checked_at), "", incident.last_checked_at],
     ], "No open incidents.");
+    fill("webhooks", webhooks, (webhook) => [
+      [webhook.host || "watcher's --alert-webhook"],
+      [webhook.targets.join(", ") || "—"],
+      [webhook.state, webhook.state === "failing" ? "down" : webhook.state === "ok" ? "up" : ""],
+      [webhook.pending ? `${webhook.pending} since ${when(webhook.oldest_pending_at)}` : "0"],
+      [when(webhook.last_success_at), "", webhook.last_success_at],
+      [webhook.last_failure_at ? `${when(webhook.last_failure_at)} (${webhook.last_error})` : "—", "",
+       webhook.consecutive_failures ? `${webhook.consecutive_failures} in a row` : ""],
+    ], "No alert webhooks yet.");
     document.getElementById("status").textContent = `Updated ${new Date().toLocaleTimeString()}.`;
     document.getElementById("error").textContent = "";
   } catch (error) {

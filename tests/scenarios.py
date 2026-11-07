@@ -7,6 +7,7 @@ separately from `incidents.py`, so a bug there shows up as a mismatch here.
 
 from collections import Counter
 from contextlib import closing, redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 import io
 from pathlib import Path
 import random
@@ -15,10 +16,21 @@ import tempfile
 import time
 from unittest.mock import patch
 
+import alerts
 from faults import EXPECTED, Clock, Faults, Receiver, resolver
 import monitor
+import webhooks
 
 SLACK_SECONDS = 0.5
+# The alert scenarios' watchers save webhook health against a clock that advances one interval per round.
+EPOCH = datetime(2026, 1, 1, tzinfo=timezone.utc)
+INTERVAL = 30
+ERRORS = {"error": "http_500", "reset": "connection_error"}
+
+
+def at(current: int) -> datetime:
+    """Return the time the alert scenarios' clock shows during a round."""
+    return EPOCH + timedelta(seconds=INTERVAL * current)
 
 
 def oracle(states: list[str], failures: int = 2, recoveries: int = 2) -> list[tuple[str, int, int]]:
@@ -167,7 +179,11 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     monitor.main(["--database", database, *arguments])
 
-            with patch.object(monitor, "sleep", side_effect=lambda _seconds: setattr(clock, "round", clock.round + 1)):
+            def next_round(_seconds):
+                clock.round += 1
+
+            with patch.object(monitor, "sleep", side_effect=next_round), \
+                    patch.object(webhooks, "now", side_effect=lambda: at(clock.round)):
                 for kind, _, length in segments:
                     if kind == "watch":
                         cli("watch", "--count", str(length), "--workers", "4", "--alert-webhook",
@@ -179,6 +195,7 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
                             clock.round += 1
             with closing(monitor.connect(Path(database))) as connection:
                 saved = saved_states(connection)
+                health = {row["route"]: row for row in alerts.webhook_health(connection)}
     finally:
         server.close()
         for receiver in receivers.values():
@@ -212,6 +229,25 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
     # Order only matters on each route; a failing webhook may fall behind the others.
     orders = [[key for label, key, _ in delivered if label == route] for route in receivers]
     deduplicated = [receiver.deduplicated() for receiver in receivers.values()]
+    routes = {"main": "default", "own": f"http://127.0.0.1:{receivers['own'].server_port}/own" if routed else None}
+    health_mismatches = []
+    for label, receiver in receivers.items():
+        # Each POST the receiver read is one delivery attempt, so its log says what the report should show.
+        attempts = [(arrived, accepted, schedules[label][arrived]) for _, arrived, accepted, _ in receiver.received]
+        successes = [arrived for arrived, accepted, _ in attempts if accepted]
+        failures = [(arrived, mode) for arrived, accepted, mode in attempts if not accepted]
+        trailing = len(attempts) - 1 - max((index for index, (_, accepted, _) in enumerate(attempts) if accepted),
+                                           default=-1)
+        expected_health = {
+            "last_success_at": at(successes[-1]).isoformat() if successes else None,
+            "last_failure_at": at(failures[-1][0]).isoformat() if failures else None,
+            "last_error": ERRORS[failures[-1][1]] if failures else None,
+            "consecutive_failures": trailing,
+            "pending": sum(1 for key in expected if wanted[key[0]] == label and key not in arrivals),
+        }
+        reported = health.get(routes[label], {})
+        health_mismatches += [f"{label}.{field}" for field, value in expected_health.items()
+                              if reported.get(field) != value]
     report = {
         "scenario": "alert delivery" + (" (skip resolved)" if skip_resolved else "") + (" (routed)" if routed else ""),
         "seed": seed, "rounds": rounds + 2, "targets": targets,
@@ -229,8 +265,9 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
         "max_delay_rounds": max((arrivals[key] - index for key, (index, _) in expected.items() if key in arrivals),
                                 default=0),
         **{name: sum(counts[name] for counts in deduplicated) for name in deduplicated[0]},
+        "health_mismatches": health_mismatches,
     }
     report["ok"] = not any(report[name] for name in ("lost", "unexpected", "misrouted", "duplicates", "out_of_order",
                                                       "not_at_first_chance", "repeated_after_dedupe",
-                                                      "key_collisions", "header_mismatches"))
+                                                      "key_collisions", "header_mismatches", "health_mismatches"))
     return report
