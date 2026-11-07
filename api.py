@@ -11,6 +11,7 @@ import sqlite3
 import sys
 from urllib.parse import parse_qs, urlsplit
 
+import alerts
 from incidents import list_incidents
 import routing
 
@@ -71,6 +72,8 @@ def routes(store) -> dict:
             connection, query.integer("limit", 20), query.text("url"))),
         "/api/summary": (("url", "target", "last", "state"), summary),
         "/api/incidents": (("url", "state", "limit", "failures", "recoveries"), incidents),
+        "/api/webhooks": ((), lambda connection, query: [routing.public_webhook(row)
+                                                          for row in alerts.webhook_health(connection)]),
     }
 
 

@@ -52,3 +52,10 @@ def public(target: dict) -> dict:
     if target["alert_webhook"] in (DEFAULT, NONE):
         return target
     return {**target, "alert_webhook": "webhook"}
+
+
+def public_webhook(row: dict) -> dict:
+    """Return a webhook health row for the unauthenticated API, naming a target's webhook only by its host."""
+    if row["route"] == DEFAULT:
+        return {**row, "host": None}
+    return {**row, "route": "webhook", "host": urlsplit(row["route"]).hostname}
