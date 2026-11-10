@@ -79,8 +79,9 @@ def routes(store) -> dict:
 
 def read_only(database: Path) -> sqlite3.Connection:
     # Opening read-only guarantees a request can never change saved history.
+    # The timeout waits out a checkpoint's brief lock instead of failing the request.
     """Open the database so that no request can change it."""
-    connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+    connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True, timeout=5.0)
     connection.row_factory = sqlite3.Row
     return connection
 
