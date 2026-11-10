@@ -62,6 +62,42 @@ def markov(rng: random.Random, rounds: int, fail: float, recover: float) -> list
     return states
 
 
+def outage_plan(rng: random.Random, rounds: int) -> list[str]:
+    """Return webhook modes where it fails in outages lasting several rounds, as a receiver that's down does."""
+    return ["up" if state == "up" else rng.choice(("error", "reset")) for state in markov(rng, rounds, 0.06, 0.15)]
+
+
+def retry_model(ready: dict, plan: list[str], alerting: list[bool], starts: set[int], limit_rounds: float) -> tuple:
+    """Replay one webhook's delivery attempts round by round, written separately from alerts.py.
+
+    `ready` maps each alert owed to the webhook to the round whose checks produced it.
+    A starting watcher tries the webhook straight away with alerts from earlier rounds,
+    whatever its backoff. After each round's checks it tries again with alerts up to
+    that round, unless it is still waiting: after `failures` failures in a row it waits
+    min(`limit_rounds`, 2 ** (failures - 1)) rounds, so 0 means it never waits. Each
+    alert is its own POST, and a failure ends the attempt. Return the round each alert
+    arrives in and the number of POSTs.
+    """
+    arrived, attempts, failures, retry = {}, 0, 0, 0
+    for current, watching in enumerate(alerting):
+        for starting in (True, False):
+            if not watching or (starting and current not in starts):
+                continue
+            waiting = [key for key, index in ready.items()
+                       if key not in arrived and (index < current if starting else index <= current)]
+            if not waiting or (not starting and current < retry):
+                continue
+            if plan[current] == "up":
+                attempts += len(waiting)
+                arrived.update(dict.fromkeys(waiting, current))
+                failures, retry = 0, 0
+            else:
+                attempts += 1
+                failures += 1
+                retry = current + min(limit_rounds, 2 ** (failures - 1))
+    return arrived, attempts
+
+
 def saved_states(connection) -> dict[str, list[dict]]:
     """Group saved checks by URL in the order they were saved."""
     grouped = {}
@@ -130,13 +166,16 @@ def probe_faults(seed: int = 1, rounds: int = 12, timeout: float = 0.4, deadline
 
 
 def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resolved: bool = False,
-                   routed: bool = False) -> dict:
+                   routed: bool = False, outages: bool = False, max_backoff: int | None = None) -> dict:
     """Run outages, webhook failures, restarts, and checks with no alerting watcher; measure each alert's delivery.
 
     With `skip_resolved`, the watcher runs with `--skip-resolved`, so incidents that
     resolve before their opening can be sent are expected to arrive not at all. With
     `routed`, the first target alerts the watcher's webhook, the second its own
-    webhook (which fails on a separate schedule), and the rest have alerts off.
+    webhook (which fails on a separate schedule), and the rest have alerts off. With
+    `outages`, webhooks fail in outages of several rounds instead of single rounds.
+    With `max_backoff`, the watcher runs with `--max-backoff`, and when each alert
+    is due comes from `retry_model`.
     """
     rng = random.Random(seed)
     names = [f"b{index}" for index in range(targets)]
@@ -161,6 +200,12 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
         other = random.Random(f"{seed}-own")
         schedules["own"] = [other.choices(("up", "error", "reset"), (0.6, 0.25, 0.15))[0]
                             for _ in range(rounds)] + ["up", "up"]
+    if outages:
+        # A separate generator, so the outages, segments, and other runs' schedules stay the same for a seed.
+        down = random.Random(f"{seed}-outages")
+        schedules = {label: outage_plan(down, rounds) + ["up", "up"] for label in schedules}
+    if max_backoff is not None:
+        options += ["--interval", str(INTERVAL), "--max-backoff", str(max_backoff)]
     clock = Clock()
     server = Faults(clock, lambda current, name: "ok" if states[name][current] == "up" else "error")
     receivers = {label: Receiver(clock, lambda current, plan=plan: plan[current]) for label, plan in schedules.items()}
@@ -221,6 +266,19 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
                     skipped += 1
                     continue
             expected[(url, event, first)] = (index, due)
+    # The model also counts the attempts each webhook should get. Skipped incidents can fail
+    # attempts before they're skipped, which it doesn't replay, so it's left out for those runs.
+    expected_attempts = None if skip_resolved else 0
+    first_chance = {key: due for key, (_, due) in expected.items()}
+    for label, plan in schedules.items():
+        if skip_resolved:
+            break
+        ready = {key: index for key, (index, _) in expected.items() if wanted[key[0]] == label}
+        arrived, attempts = retry_model(ready, plan, alerting, starts, (max_backoff or 0) / INTERVAL)
+        expected_attempts += attempts
+        if max_backoff is not None:
+            # Backoff holds alerts past the first round their webhook is up; the model says until when.
+            expected.update({key: (index, arrived.get(key)) for key, index in ready.items()})
     delivered = [(label, (body["url"], body["event"], rounds_by_id[body["incident"]["first_failure_id"]]), arrived)
                  for label, receiver in receivers.items()
                  for body, arrived, accepted, _key in receiver.received if accepted]
@@ -249,7 +307,8 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
         health_mismatches += [f"{label}.{field}" for field, value in expected_health.items()
                               if reported.get(field) != value]
     report = {
-        "scenario": "alert delivery" + (" (skip resolved)" if skip_resolved else "") + (" (routed)" if routed else ""),
+        "scenario": "alert delivery" + (" (skip resolved)" if skip_resolved else "") + (" (routed)" if routed else "")
+                    + (" (outages)" if outages else "") + (f" (backoff {max_backoff} s)" if max_backoff else ""),
         "seed": seed, "rounds": rounds + 2, "targets": targets,
         "watcher_starts": sum(kind == "watch" for kind, _, _ in segments),
         "rounds_without_alerting": alerting.count(False),
@@ -265,9 +324,19 @@ def alert_delivery(seed: int = 1, rounds: int = 40, targets: int = 3, skip_resol
         "max_delay_rounds": max((arrivals[key] - index for key, (index, _) in expected.items() if key in arrivals),
                                 default=0),
         **{name: sum(counts[name] for counts in deduplicated) for name in deduplicated[0]},
+        # How many rounds past its webhook's first good round an alert waited, when the backoff held it.
+        "max_held_by_backoff_rounds": max((arrivals[key] - first_chance[key] for key in expected
+                                           if key in arrivals and first_chance.get(key) is not None), default=0)
+                                      if max_backoff is not None else 0,
+        "attempts": sum(len(receiver.received) for receiver in receivers.values()),
+        "failed_attempts": sum(not accepted for receiver in receivers.values()
+                               for _, _, accepted, _ in receiver.received),
+        "expected_attempts": expected_attempts,
         "health_mismatches": health_mismatches,
     }
     report["ok"] = not any(report[name] for name in ("lost", "unexpected", "misrouted", "duplicates", "out_of_order",
                                                       "not_at_first_chance", "repeated_after_dedupe",
                                                       "key_collisions", "header_mismatches", "health_mismatches"))
+    if expected_attempts is not None:
+        report["ok"] = report["ok"] and report["attempts"] == expected_attempts
     return report

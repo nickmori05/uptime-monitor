@@ -148,10 +148,13 @@ def unsent_alerts(connection: sqlite3.Connection, *, skip_resolved: bool = False
     return unsent
 
 
-def start(connection: sqlite3.Connection, webhook: str | None, *, skip_resolved: bool = False) -> list[dict]:
+def start(connection: sqlite3.Connection, webhook: str | None, *, skip_resolved: bool = False,
+          backoff: webhooks.Backoff | None = None) -> list[dict]:
     """Prepare a watcher to alert, sending any events missed while no alerting watcher was running.
 
     With `skip_resolved`, missed incidents that have already resolved are skipped instead.
+    Every webhook with alerts owed is tried once now, even one a backoff would leave alone,
+    since a restart is when a fixed webhook is most likely to be waiting.
     """
     skipped = skip_backlog(connection)
     if skipped:
@@ -163,7 +166,7 @@ def start(connection: sqlite3.Connection, webhook: str | None, *, skip_resolved:
     if not missed:
         return []
     print(f"Sending {missed} incident event(s) not alerted yet.", file=sys.stderr, flush=True)
-    return deliver(connection, webhook, skip_resolved=skip_resolved)
+    return deliver(connection, webhook, skip_resolved=skip_resolved, backoff=backoff, retry_now=True)
 
 
 def idempotency_key(url: str, first_failure_id: int, opened_at: str, event: str) -> str:
@@ -228,18 +231,23 @@ def send_webhook(webhook: str, body: dict, timeout: float = WEBHOOK_TIMEOUT,
     return outcome[0] if outcome else "deadline_exceeded"
 
 
-def deliver(connection: sqlite3.Connection, webhook: str | None, *, skip_resolved: bool = False) -> list[dict]:
+def deliver(connection: sqlite3.Connection, webhook: str | None, *, skip_resolved: bool = False,
+            backoff: webhooks.Backoff | None = None, retry_now: bool = False) -> list[dict]:
     """Send pending alerts on every route they are owed, in order on each route. Return the bodies sent.
 
     A route stops at its first failure this round, so its alerts are retried in
-    order next round, while other routes carry on. The default route needs
-    `webhook`; without one, alerts owed there wait for a watcher that has it. An
-    alert owed nowhere (every target for its URL has alerts off) is skipped. With
-    `skip_resolved`, incidents that resolved before their opening was sent are skipped first.
+    order next round, while other routes carry on. With `backoff`, a failed route
+    is left alone until its saved retry time instead, unless `retry_now`. The
+    default route needs `webhook`; without one, alerts owed there wait for a
+    watcher that has it. An alert owed nowhere (every target for its URL has
+    alerts off) is skipped. With `skip_resolved`, incidents that resolved before
+    their opening was sent are skipped first.
     """
     if skip_resolved:
         skip_resolved_incidents(connection)
-    sent, stopped = [], set()
+    sent = []
+    # Routes still waiting out a backoff are held like routes that already failed this round.
+    stopped = webhooks.backing_off(connection) if backoff is not None and not retry_now else set()
     for event, owed, reached in plan(connection, webhook):
         if reached.issuperset(owed):
             # Owed nowhere, or every route it still has was reached before the rest were removed.
@@ -250,10 +258,11 @@ def deliver(connection: sqlite3.Connection, webhook: str | None, *, skip_resolve
             if route in reached or route in stopped or (route == routing.DEFAULT and webhook is None):
                 continue
             error = send_webhook(webhook if route == routing.DEFAULT else route, body)
-            webhooks.note(connection, route, error)
+            retry_at = webhooks.note(connection, route, error, backoff)
             where = routing.describe(route)
             if error is not None:
-                print(f"Alert not delivered ({error}){where}; retrying next round.", file=sys.stderr, flush=True)
+                when = "next round" if retry_at is None else f"after {retry_at.isoformat(timespec='seconds')}"
+                print(f"Alert not delivered ({error}){where}; retrying {when}.", file=sys.stderr, flush=True)
                 stopped.add(route)
                 continue
             reached.add(route)
@@ -270,18 +279,20 @@ def deliver(connection: sqlite3.Connection, webhook: str | None, *, skip_resolve
 class Alerter:
     """Send one watcher's alerts each round, starting the first time it has somewhere to send them."""
 
-    def __init__(self, connection: sqlite3.Connection, webhook: str | None = None, *, skip_resolved: bool = False):
+    def __init__(self, connection: sqlite3.Connection, webhook: str | None = None, *, skip_resolved: bool = False,
+                 backoff: webhooks.Backoff | None = None):
         self.connection, self.webhook, self.skip_resolved = connection, webhook, skip_resolved
+        self.backoff = backoff
         self.started = False
 
     def __call__(self) -> list[dict]:
         if self.started:
-            return deliver(self.connection, self.webhook, skip_resolved=self.skip_resolved)
+            return deliver(self.connection, self.webhook, skip_resolved=self.skip_resolved, backoff=self.backoff)
         # Targets are reloaded every round, so one given a webhook mid-run starts alerting then.
         if self.webhook is None and not routing.has_webhooks(self.connection):
             return []
         self.started = True
-        return start(self.connection, self.webhook, skip_resolved=self.skip_resolved)
+        return start(self.connection, self.webhook, skip_resolved=self.skip_resolved, backoff=self.backoff)
 
 
 def webhook_health(connection: sqlite3.Connection) -> list[dict]:

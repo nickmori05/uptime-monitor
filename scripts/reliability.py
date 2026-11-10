@@ -29,6 +29,8 @@ def main(argv: list[str] | None = None) -> int:
         lambda: alert_delivery(seed=args.seed, rounds=args.rounds),
         lambda: alert_delivery(seed=args.seed, rounds=args.rounds, skip_resolved=True),
         lambda: alert_delivery(seed=args.seed, rounds=args.rounds, routed=True),
+        lambda: alert_delivery(seed=args.seed, rounds=args.rounds, routed=True, outages=True),
+        lambda: alert_delivery(seed=args.seed, rounds=args.rounds, routed=True, outages=True, max_backoff=240),
         lambda: crash_recovery(seed=args.seed, rounds=max(10, args.rounds // 5)),
         kill_during_delivery,
     ]

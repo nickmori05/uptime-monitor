@@ -3,13 +3,39 @@
 Routes are named as in `routing`: `default` for the watcher's own `--alert-webhook`,
 or a target's webhook URL. Every delivery attempt is saved in the `webhooks` table,
 and the queue is worked out from the alerts still pending, so the report needs no
-running watcher.
+running watcher. A watcher with a `Backoff` also saves when a failing webhook may
+be tried again, and leaves it alone until then.
 """
 
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import math
 import sqlite3
 
 import routing
+
+MAX_BACKOFF = 86400
+
+
+@dataclass(frozen=True)
+class Backoff:
+    """Wait `first` seconds after a webhook's first failure in a row, doubling after each further one, up to `limit`."""
+    first: float
+    limit: float
+
+    def __post_init__(self):
+        for value in (self.first, self.limit):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError("Backoff must be a number of seconds.")
+        if self.first <= 0:
+            raise ValueError("The first backoff must be greater than 0 seconds.")
+        if not self.first <= self.limit <= MAX_BACKOFF:
+            raise ValueError(f"--max-backoff must be at least the interval and at most {MAX_BACKOFF} seconds.")
+
+    def delay(self, failures: int) -> float:
+        """Return how long to wait after `failures` failed attempts in a row."""
+        # The exponent is capped so a long outage can't overflow; 2**32 intervals is past any limit.
+        return min(self.limit, self.first * 2 ** min(failures - 1, 32))
 
 
 def now() -> datetime:
@@ -17,21 +43,39 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def note(connection: sqlite3.Connection, route: str, error: str | None) -> None:
-    """Save the outcome of one delivery attempt to `route`: None when it was accepted, else its error code."""
-    at = now().isoformat()
+def note(connection: sqlite3.Connection, route: str, error: str | None,
+         backoff: Backoff | None = None) -> datetime | None:
+    """Save the outcome of one delivery attempt to `route`: None when it was accepted, else its error code.
+
+    With `backoff`, a failure also saves when the route may be tried again, which is returned.
+    Otherwise the route is tried again next round, and None is returned.
+    """
+    current = now()
     with connection:
         if error is None:
             connection.execute(
                 """INSERT INTO webhooks (route, last_success_at, failures) VALUES (?, ?, 0)
-                   ON CONFLICT(route) DO UPDATE SET last_success_at = excluded.last_success_at, failures = 0""",
-                (route, at))
-        else:
-            connection.execute(
-                """INSERT INTO webhooks (route, last_failure_at, last_error, failures) VALUES (?, ?, ?, 1)
-                   ON CONFLICT(route) DO UPDATE SET last_failure_at = excluded.last_failure_at,
-                   last_error = excluded.last_error, failures = webhooks.failures + 1""",
-                (route, at, error))
+                   ON CONFLICT(route) DO UPDATE SET last_success_at = excluded.last_success_at, failures = 0,
+                   retry_at = NULL""",
+                (route, current.isoformat()))
+            return None
+        connection.execute(
+            """INSERT INTO webhooks (route, last_failure_at, last_error, failures) VALUES (?, ?, ?, 1)
+               ON CONFLICT(route) DO UPDATE SET last_failure_at = excluded.last_failure_at,
+               last_error = excluded.last_error, failures = webhooks.failures + 1""",
+            (route, current.isoformat(), error))
+        failures = connection.execute("SELECT failures FROM webhooks WHERE route = ?", (route,)).fetchone()[0]
+        retry_at = None if backoff is None else current + timedelta(seconds=backoff.delay(failures))
+        connection.execute("UPDATE webhooks SET retry_at = ? WHERE route = ?",
+                           (None if retry_at is None else retry_at.isoformat(), route))
+    return retry_at
+
+
+def backing_off(connection: sqlite3.Connection) -> set[str]:
+    """Return the routes that failed recently enough that a watcher with a backoff should leave them alone."""
+    current = now()
+    rows = connection.execute("SELECT route, retry_at FROM webhooks WHERE retry_at IS NOT NULL")
+    return {row["route"] for row in rows if datetime.fromisoformat(row["retry_at"]) > current}
 
 
 def report(connection: sqlite3.Connection, unsent: list[dict]) -> list[dict]:
@@ -66,5 +110,6 @@ def report(connection: sqlite3.Connection, unsent: list[dict]) -> list[dict]:
             "last_failure_at": health.get("last_failure_at"),
             "last_error": health.get("last_error"),
             "consecutive_failures": failures,
+            "retry_at": health.get("retry_at"),
         })
     return rows
