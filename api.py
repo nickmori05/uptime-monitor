@@ -37,7 +37,7 @@ class Query:
     def text(self, name: str) -> str | None:
         return self.values.get(name)
 
-    def integer(self, name: str, default: int) -> int:
+    def integer(self, name: str, default: int | None) -> int | None:
         value = self.values.get(name)
         if value is None:
             return default
@@ -62,7 +62,7 @@ def routes(store) -> dict:
         return list_incidents(
             connection, url=store.validate_url(url) if url is not None else None,
             state=query.text("state"), limit=query.integer("limit", 20),
-            failures=query.integer("failures", 2), recoveries=query.integer("recoveries", 2),
+            failures=query.integer("failures", None), recoveries=query.integer("recoveries", None),
         )
 
     return {

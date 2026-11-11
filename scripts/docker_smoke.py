@@ -194,6 +194,30 @@ def main():
                    if row["route"] == "http://fixture:8000/broken-webhook"]
         assert (broken["consecutive_failures"], broken["retry_at"]) == (4, None), broken
         print("Webhook backoff passed.", flush=True)
+
+        # One failed check opens an incident for a target that asked for that, and not for one that
+        # left the default of 2. The report, the pending alert, and the API all show that reading.
+        # Clearing the override removes the incident from the report and from the alerts still queued.
+        command("add", "touchy", "http://fixture:8000/touchy", "--timeout", "2", "--failures", "1")
+        command("add", "steady", "http://fixture:8000/steady", "--timeout", "2")
+        command("run", "touchy", expected=1)
+        command("run", "steady", expected=1)
+        touchy, = json.loads(command("incidents", "--url", "http://fixture:8000/touchy"))
+        assert (touchy["state"], touchy["failures"], touchy["recoveries"], touchy["failed_checks"]) == (
+            "open", 1, 2, 1), touchy
+        assert json.loads(command("incidents", "--url", "http://fixture:8000/steady")) == []
+        waiting = [row for row in json.loads(command("alerts", "--pending")) if row["url"] == touchy["url"]]
+        assert len(waiting) == 1 and waiting[0]["incident"] == touchy, waiting
+        assert all(row["url"] != "http://fixture:8000/steady" for row in json.loads(command("alerts", "--pending")))
+        served = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/targets"]))
+        by_name = {row["name"]: (row["failures"], row["recoveries"]) for row in served}
+        assert (by_name["touchy"], by_name["steady"]) == ((1, None), (None, None)), by_name
+        command("update", "touchy", "--no-failures")
+        assert json.loads(command("incidents", "--url", "http://fixture:8000/touchy")) == []
+        assert all(row["url"] != touchy["url"] for row in json.loads(command("alerts", "--pending")))
+        listed = {row["name"]: row["failures"] for row in json.loads(command("targets"))}
+        assert listed["touchy"] is None, listed
+        print("Per-target incident thresholds passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)

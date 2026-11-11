@@ -21,13 +21,15 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import alerts
 import api
-from incidents import list_incidents
+from incidents import ensure_agreement, list_incidents, validate_count
 import routing
 import webhooks
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / ".local" / "checks.sqlite3"
 ALERT_WEBHOOK_COLUMN = ("TEXT NOT NULL DEFAULT 'default' CHECK(alert_webhook IN ('default', 'none') "
                         "OR alert_webhook LIKE 'http://%' OR alert_webhook LIKE 'https://%')")
+FAILURES_COLUMN = "INTEGER CHECK(failures IS NULL OR (failures >= 1 AND failures <= 100))"
+RECOVERIES_COLUMN = "INTEGER CHECK(recoveries IS NULL OR (recoveries >= 1 AND recoveries <= 100))"
 
 
 @dataclass(frozen=True)
@@ -187,7 +189,9 @@ def connect(database: Path) -> sqlite3.Connection:
             url TEXT NOT NULL,
             timeout REAL NOT NULL CHECK(timeout > 0 AND timeout <= 60),
             deadline REAL CHECK(deadline IS NULL OR (deadline > 0 AND deadline <= 60)),
-            alert_webhook {ALERT_WEBHOOK_COLUMN}
+            alert_webhook {ALERT_WEBHOOK_COLUMN},
+            failures {FAILURES_COLUMN},
+            recoveries {RECOVERIES_COLUMN}
         )"""
     )
     # Databases created before targets had a saved deadline gain the column empty.
@@ -198,6 +202,11 @@ def connect(database: Path) -> sqlite3.Connection:
     # Targets saved before alert routing send to the watcher's own webhook, as they always did.
     if "alert_webhook" not in columns:
         connection.execute(f"ALTER TABLE targets ADD COLUMN alert_webhook {ALERT_WEBHOOK_COLUMN}")
+    # Targets saved before per-target thresholds keep the default of 2 failures and 2 recoveries.
+    if "failures" not in columns:
+        connection.execute(f"ALTER TABLE targets ADD COLUMN failures {FAILURES_COLUMN}")
+    if "recoveries" not in columns:
+        connection.execute(f"ALTER TABLE targets ADD COLUMN recoveries {RECOVERIES_COLUMN}")
     connection.execute("CREATE INDEX IF NOT EXISTS checks_url_id ON checks(url, id)")
     # One row per incident event, so an alert is never sent twice for the same change.
     connection.execute(
@@ -310,8 +319,18 @@ def summarize(connection: sqlite3.Connection, last: int = 100, url: str | None =
     return [dict(row) for row in rows if state is None or row["latest_state"] == state]
 
 
+def _require_agreement(connection: sqlite3.Connection, name: str, url: str,
+                       failures: int | None, recoveries: int | None) -> None:
+    """Reject a target whose thresholds disagree with another target of the same URL."""
+    others = [{"name": row["name"], "failures": row["failures"], "recoveries": row["recoveries"]}
+              for row in connection.execute(
+                  "SELECT name, failures, recoveries FROM targets WHERE url = ? AND name != ?", (url, name))]
+    ensure_agreement(url, [*others, {"name": name, "failures": failures, "recoveries": recoveries}])
+
+
 def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: float = 5.0,
-               deadline: float | None = None, alert_webhook: str = routing.DEFAULT) -> dict:
+               deadline: float | None = None, alert_webhook: str = routing.DEFAULT,
+               failures: int | None = None, recoveries: int | None = None) -> dict:
     """Save a new named target without checking it."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
         raise ValueError("Name must be 1–64 letters, digits, hyphens, or underscores, starting with a letter or digit.")
@@ -319,14 +338,21 @@ def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: flo
     timeout = validate_timeout(timeout)
     deadline = validate_deadline(deadline)
     alert_webhook = validate_alert_webhook(alert_webhook)
+    if failures is not None:
+        failures = validate_count("Failures", failures)
+    if recoveries is not None:
+        recoveries = validate_count("Recoveries", recoveries)
     try:
         with connection:
+            _require_agreement(connection, name, url, failures, recoveries)
             connection.execute(
-                "INSERT INTO targets (name, url, timeout, deadline, alert_webhook) VALUES (?, ?, ?, ?, ?)",
-                (name, url, timeout, deadline, alert_webhook))
+                """INSERT INTO targets (name, url, timeout, deadline, alert_webhook, failures, recoveries)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (name, url, timeout, deadline, alert_webhook, failures, recoveries))
     except sqlite3.IntegrityError as error:
         raise ValueError(f"A target named '{name}' already exists.") from error
-    return {"name": name, "url": url, "timeout": timeout, "deadline": deadline, "alert_webhook": alert_webhook}
+    return {"name": name, "url": url, "timeout": timeout, "deadline": deadline, "alert_webhook": alert_webhook,
+            "failures": failures, "recoveries": recoveries}
 
 
 def get_target(connection: sqlite3.Connection, name: str) -> dict:
@@ -345,12 +371,23 @@ def list_targets(connection: sqlite3.Connection) -> list[dict]:
 def update_target(connection: sqlite3.Connection, name: str, *,
                   url: str | None = None, timeout: float | None = None,
                   deadline: float | None = None, clear_deadline: bool = False,
-                  alert_webhook: str | None = None) -> dict:
-    """Change a saved target's URL, timeout, deadline, or alert webhook, keeping settings that aren't given."""
+                  alert_webhook: str | None = None,
+                  failures: int | None = None, clear_failures: bool = False,
+                  recoveries: int | None = None, clear_recoveries: bool = False) -> dict:
+    """Change a saved target's URL, timeout, deadline, alert webhook, or incident thresholds.
+
+    Settings that aren't given are kept. Clearing a threshold puts that count back
+    at the default.
+    """
     if deadline is not None and clear_deadline:
         raise ValueError("Choose either a new deadline or clearing it, not both.")
-    if url is None and timeout is None and deadline is None and not clear_deadline and alert_webhook is None:
-        raise ValueError("Provide a URL, timeout, deadline, or alert webhook to update.")
+    if failures is not None and clear_failures:
+        raise ValueError("Choose either a new failure threshold or clearing it, not both.")
+    if recoveries is not None and clear_recoveries:
+        raise ValueError("Choose either a new recovery threshold or clearing it, not both.")
+    if (url is None and timeout is None and deadline is None and not clear_deadline and alert_webhook is None
+            and failures is None and not clear_failures and recoveries is None and not clear_recoveries):
+        raise ValueError("Provide a URL, timeout, deadline, alert webhook, or incident threshold to update.")
     if alert_webhook is not None:
         alert_webhook = validate_alert_webhook(alert_webhook)
     if url is not None:
@@ -358,12 +395,25 @@ def update_target(connection: sqlite3.Connection, name: str, *,
     if timeout is not None:
         timeout = validate_timeout(timeout)
     deadline = validate_deadline(deadline)
+    if failures is not None:
+        failures = validate_count("Failures", failures)
+    if recoveries is not None:
+        recoveries = validate_count("Recoveries", recoveries)
     with connection:
+        current = get_target(connection, name)
+        new_url = current["url"] if url is None else url
+        new_failures = None if clear_failures else current["failures"] if failures is None else failures
+        new_recoveries = None if clear_recoveries else current["recoveries"] if recoveries is None else recoveries
+        _require_agreement(connection, name, new_url, new_failures, new_recoveries)
         cursor = connection.execute(
             """UPDATE targets SET url = COALESCE(?, url), timeout = COALESCE(?, timeout),
                deadline = CASE WHEN ? THEN NULL ELSE COALESCE(?, deadline) END,
-               alert_webhook = COALESCE(?, alert_webhook) WHERE name = ?""",
-            (url, timeout, clear_deadline, deadline, alert_webhook, name),
+               alert_webhook = COALESCE(?, alert_webhook),
+               failures = CASE WHEN ? THEN NULL ELSE COALESCE(?, failures) END,
+               recoveries = CASE WHEN ? THEN NULL ELSE COALESCE(?, recoveries) END
+               WHERE name = ?""",
+            (url, timeout, clear_deadline, deadline, alert_webhook,
+             clear_failures, failures, clear_recoveries, recoveries, name),
         )
         if cursor.rowcount == 0:
             raise ValueError(f"Target '{name}' does not exist.")
@@ -480,7 +530,12 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("--deadline", type=float, help="Default whole-request limit for this target's runs")
     add.add_argument("--alert-webhook", default=routing.DEFAULT, metavar="default|none|URL",
                      help="Where this target's alerts go: the watcher's webhook (default), nowhere, or this URL")
-    update = commands.add_parser("update", help="Change a saved target's URL, timeout, deadline, or alert webhook")
+    add.add_argument("--failures", type=int,
+                     help="Consecutive failures before this target's incidents open (default: 2)")
+    add.add_argument("--recoveries", type=int,
+                     help="Consecutive successes before this target's incidents resolve (default: 2)")
+    update = commands.add_parser(
+        "update", help="Change a saved target's URL, timeout, deadline, alert webhook, or incident thresholds")
     update.add_argument("name")
     update.add_argument("--url", help="Save a new URL")
     update.add_argument("--timeout", type=float, help="Save a new socket timeout")
@@ -488,6 +543,14 @@ def parser() -> argparse.ArgumentParser:
     update_deadline.add_argument("--deadline", type=float, help="Save a new default deadline")
     update_deadline.add_argument("--no-deadline", action="store_true", help="Clear the saved deadline")
     update.add_argument("--alert-webhook", metavar="default|none|URL", help="Save where this target's alerts go")
+    update_failures = update.add_mutually_exclusive_group()
+    update_failures.add_argument("--failures", type=int, help="Save how many consecutive failures open an incident")
+    update_failures.add_argument("--no-failures", action="store_true", help="Use the default of 2 consecutive failures")
+    update_recoveries = update.add_mutually_exclusive_group()
+    update_recoveries.add_argument("--recoveries", type=int,
+                                   help="Save how many consecutive successes resolve an incident")
+    update_recoveries.add_argument("--no-recoveries", action="store_true",
+                                   help="Use the default of 2 consecutive successes")
     commands.add_parser("targets", help="List saved targets")
     remove = commands.add_parser("remove", help="Remove a saved target without deleting its history")
     remove.add_argument("name")
@@ -519,8 +582,10 @@ def parser() -> argparse.ArgumentParser:
     incidents.add_argument("--url", type=url_argument, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"), help="Only report open or resolved incidents")
     incidents.add_argument("--limit", type=int, default=20, help="Incidents to show, 1–1000 (default: 20)")
-    incidents.add_argument("--failures", type=int, default=2, help="Consecutive failures to open an incident")
-    incidents.add_argument("--recoveries", type=int, default=2, help="Consecutive successes to resolve it")
+    incidents.add_argument("--failures", type=int, help="Reinterpret every URL with this many consecutive failures, "
+                           "ignoring saved thresholds")
+    incidents.add_argument("--recoveries", type=int, help="Reinterpret every URL with this many consecutive successes, "
+                           "ignoring saved thresholds")
     serve = commands.add_parser("serve", help="Serve a dashboard and read-only JSON API for saved results")
     serve.add_argument("--host", default="127.0.0.1", help="Address to listen on (default: 127.0.0.1)")
     serve.add_argument("--port", type=int, default=8080, help="Port to listen on, 0 for any free port (default: 8080)")
@@ -588,7 +653,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(summarize(connection, args.last, url, state=args.state), indent=2))
                 return 0
             if args.command == "add":
-                target = add_target(connection, args.name, args.url, args.timeout, args.deadline, args.alert_webhook)
+                target = add_target(connection, args.name, args.url, args.timeout, args.deadline,
+                                    args.alert_webhook, args.failures, args.recoveries)
                 print(json.dumps(target, indent=2))
                 return 0
             if args.command == "targets":
@@ -597,7 +663,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "update":
                 target = update_target(connection, args.name, url=args.url, timeout=args.timeout,
                                        deadline=args.deadline, clear_deadline=args.no_deadline,
-                                       alert_webhook=args.alert_webhook)
+                                       alert_webhook=args.alert_webhook,
+                                       failures=args.failures, clear_failures=args.no_failures,
+                                       recoveries=args.recoveries, clear_recoveries=args.no_recoveries)
                 print(json.dumps(target, indent=2))
                 return 0
             if args.command == "remove":
