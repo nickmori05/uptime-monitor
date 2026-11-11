@@ -55,7 +55,8 @@ def routes(store) -> dict:
             raise ValueError("Choose either url or target, not both.")
         if target is not None:
             url = store.get_target(connection, target)["url"]
-        return store.summarize(connection, query.integer("last", 100), url, state=query.text("state"))
+        return store.summarize(connection, query.integer("last", 100), url, state=query.text("state"),
+                               slow_ms=query.integer("slow_ms", None))
 
     def incidents(connection, query):
         url = query.text("url")
@@ -70,7 +71,7 @@ def routes(store) -> dict:
                                                          for target in store.list_targets(connection)]),
         "/api/history": (("limit", "url"), lambda connection, query: store.history(
             connection, query.integer("limit", 20), query.text("url"))),
-        "/api/summary": (("url", "target", "last", "state"), summary),
+        "/api/summary": (("url", "target", "last", "state", "slow_ms"), summary),
         "/api/incidents": (("url", "state", "limit", "failures", "recoveries"), incidents),
         "/api/webhooks": ((), lambda connection, query: [routing.public_webhook(row)
                                                           for row in alerts.webhook_health(connection)]),
