@@ -66,6 +66,13 @@ class DashboardTests(unittest.TestCase):
             "https://example.com", "2026-10-15T12:00:00+00:00", "down", None, 3000.0, "timeout"))
         paths = re.findall(r'"(/api/[^"]*)"', self.page)
         self.assertEqual(len(paths), 4, paths)
+        incidents = [path for path in paths if "incidents" in path]
+        self.assertEqual(incidents, ["/api/incidents?state=open&limit=100"])
+        self.assertNotIn("failures=", incidents[0])
+        self.assertNotIn("recoveries=", incidents[0])
+        self.assertIn("target.failures", self.page)
+        self.assertIn("incident.failures", self.page)
+        self.assertIn(">Threshold<", self.page)
         for path in paths:
             with self.subTest(path=path):
                 self.assertEqual(fetch(self.base_url + path)[0], 200)

@@ -29,13 +29,13 @@ td.url { overflow-wrap: anywhere; min-width: 14em; }
 
 <h2>Endpoints</h2>
 <div class="wide"><table>
-<thead><tr><th>Targets</th><th>URL</th><th>Latest</th><th>Last checked</th><th>Up / sampled</th><th>Avg latency</th></tr></thead>
+<thead><tr><th>Targets</th><th>Threshold</th><th>URL</th><th>Latest</th><th>Last checked</th><th>Up / sampled</th><th>Avg latency</th></tr></thead>
 <tbody id="endpoints"></tbody>
 </table></div>
 
 <h2>Open incidents</h2>
 <div class="wide"><table>
-<thead><tr><th>URL</th><th>Opened</th><th>Failed checks</th><th>Last checked</th></tr></thead>
+<thead><tr><th>URL</th><th>Opened</th><th>Failed checks</th><th>Threshold</th><th>Last checked</th></tr></thead>
 <tbody id="incidents"></tbody>
 </table></div>
 
@@ -46,7 +46,8 @@ td.url { overflow-wrap: anywhere; min-width: 14em; }
 </table></div>
 
 <p class="note">Saved observations from the last 100 checks per URL, refreshed every 30 seconds.
-They describe past checks, not whether an endpoint is up right now.</p>
+Open incidents use each target's saved thresholds, the same ones alerts use.
+Observations describe past checks, not whether an endpoint is up right now.</p>
 
 <script>
 "use strict";
@@ -88,18 +89,32 @@ function latest(summary) {
   return [`${summary.latest_state}${detail ? ` (${detail})` : ""}`, summary.latest_state];
 }
 
+function thresholdText(target) {
+  if (target.failures == null && target.recoveries == null) return "default";
+  const down = target.failures == null ? 2 : target.failures;
+  const up = target.recoveries == null ? 2 : target.recoveries;
+  return `${down} down, ${up} up`;
+}
+
+function thresholdLabel(group) {
+  if (!group.length) return "—";
+  if (group.every((target) => target.failures == null && target.recoveries == null)) return "default";
+  return group.map((target) => `${target.name}: ${thresholdText(target)}`).join(", ");
+}
+
 async function refresh() {
   try {
     const [targets, summaries, incidents, webhooks] = await Promise.all(
       ["/api/targets", "/api/summary", "/api/incidents?state=open&limit=100", "/api/webhooks"].map(load));
-    const byUrl = new Map(summaries.map((summary) => [summary.url, { summary, names: [] }]));
+    const byUrl = new Map(summaries.map((summary) => [summary.url, { summary, targets: [] }]));
     for (const target of targets) {
-      if (!byUrl.has(target.url)) byUrl.set(target.url, { summary: null, names: [] });
-      byUrl.get(target.url).names.push(target.name);
+      if (!byUrl.has(target.url)) byUrl.set(target.url, { summary: null, targets: [] });
+      byUrl.get(target.url).targets.push(target);
     }
     const endpoints = [...byUrl].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    fill("endpoints", endpoints, ([url, { summary, names }]) => [
-      [names.join(", ") || "—"],
+    fill("endpoints", endpoints, ([url, { summary, targets: group }]) => [
+      [group.map((target) => target.name).join(", ") || "—"],
+      [thresholdLabel(group)],
       [url, "url"],
       latest(summary),
       [when(summary?.latest_checked_at), "", summary?.latest_checked_at],
@@ -110,6 +125,7 @@ async function refresh() {
       [incident.url, "url"],
       [when(incident.opened_at), "", incident.opened_at],
       [String(incident.failed_checks)],
+      [`${incident.failures} down, ${incident.recoveries} up`],
       [when(incident.last_checked_at), "", incident.last_checked_at],
     ], "No open incidents.");
     fill("webhooks", webhooks, (webhook) => [

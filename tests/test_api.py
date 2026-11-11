@@ -182,7 +182,8 @@ class ServeCommandTests(unittest.TestCase):
                     with urlopen(address + "/api/targets", timeout=5) as response:
                         targets = json.loads(response.read())
                     self.assertEqual(targets, [{"name": "home", "url": "https://example.com",
-                                                "timeout": 3, "deadline": None, "alert_webhook": "default"}])
+                                                "timeout": 3, "deadline": None, "alert_webhook": "default",
+                                                "failures": None, "recoveries": None}])
                     with urlopen(address + "/", timeout=5) as response:
                         self.assertIn(b"<title>Uptime Monitor</title>", response.read())
                     process.send_signal(stop_signal)
