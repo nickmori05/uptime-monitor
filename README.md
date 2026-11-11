@@ -66,21 +66,33 @@ SIGTERM.
 ### Targets
 
 ```sh
-python3 monitor.py add example https://example.com --timeout 3 --deadline 10
+python3 monitor.py add example https://example.com --timeout 3 --deadline 10 --failures 3
 python3 monitor.py update example --url https://example.com/health
 python3 monitor.py update example --no-deadline
+python3 monitor.py update example --recoveries 1
+python3 monitor.py update example --no-failures --no-recoveries
 python3 monitor.py update example --alert-webhook https://hooks.example.com/team
 python3 monitor.py run example
 python3 monitor.py targets
 python3 monitor.py remove example
 ```
 
-A target saves a URL, a timeout, an optional default deadline, and where its
-alerts go (see [Routing alerts per target](#routing-alerts-per-target)) under a
+A target saves a URL, a timeout, an optional default deadline, where its
+alerts go (see [Routing alerts per target](#routing-alerts-per-target)), and how
+many consecutive failures open an incident and successes resolve it, under a
 name (1–64 letters, digits, `-` or `_`, starting with a letter or digit). `add` and
 `update` never make a request. Removing or re-pointing a target keeps its past
 checks, which stay tied to the URL they were made against. A `--deadline` given
 to `run`, `run-all`, or `watch` overrides saved deadlines for that run only.
+
+`--failures` and `--recoveries` default to unset, which means 2. Each must be a
+whole number from 1 to 100. `targets` shows a count as `null` until it is set.
+`--no-failures` and `--no-recoveries` put one count back at the default without
+changing the other. Targets that check the same URL share its incidents, so
+they share one pair of counts: an override on any of them applies to the URL, a
+count none of them set stays at 2, and saving a second override that disagrees
+is rejected. A URL no target checks (a bare `check`, or a target that was
+removed) uses 2 and 2.
 
 ### Batches and the watcher
 
@@ -109,11 +121,17 @@ python3 monitor.py summary --target example --last 50
 python3 monitor.py summary --state down
 ```
 
-An incident opens after `--failures` consecutive failed checks of the same URL
-(default 2) and resolves after `--recoveries` consecutive successes (default 2).
-With the defaults, one success between failures keeps it open. Reports are
-rebuilt from saved checks in insertion order every time, so changing the
-thresholds reinterprets history without editing it.
+An incident opens after a number of consecutive failed checks of the same URL
+and resolves after a number of consecutive successes. Both default to 2, and a
+target can save its own (see [Targets](#targets)). With the defaults, one
+success between failures keeps the incident open. `incidents` with no counts
+given uses those saved thresholds, and so do alerts, so the two describe the
+same incidents. `--failures` and `--recoveries` reinterpret every URL for that
+one report; the count you leave out stays at 2, and alerts are unchanged.
+Passing either one does not read saved thresholds. Reports are rebuilt from
+saved checks in insertion order every time, so changing a target's counts
+reinterprets its history without editing the checks. Each incident includes the
+`failures` and `recoveries` counts that produced it.
 
 Checks are samples, so an incident's exact length is unknown, but its checks
 bound it. Each incident reports `min_downtime_seconds`, from its first failed
@@ -146,7 +164,8 @@ python3 monitor.py webhooks
 ```
 
 With `--alert-webhook`, the watcher POSTs one JSON object after each round for
-every new incident event, using the default thresholds:
+every new incident event, using each URL's saved thresholds (the same ones
+`incidents` uses when no counts are given):
 
 ```json
 {"event": "opened", "url": "https://example.com", "idempotency_key": "5e57d713...", "text": "Incident opened for ...", "incident": {"...": "..."}}
@@ -298,8 +317,14 @@ token, so `/api/targets` shows a target's own webhook only as `"webhook"`, and
 unknown parameters return `400`, unknown paths `404`, and other methods `405`.
 
 `/` serves `dashboard.html`: a single static page that lists each target's
-latest result, recent up/down counts, average latency, open incidents, and
-each alert webhook's health, and refreshes every 30 seconds. It has no external resources, inserts saved values
+latest result, recent up/down counts, average latency, incident thresholds,
+open incidents, and each alert webhook's health, and refreshes every 30 seconds.
+The open incidents are the ones `incidents` reports with no counts given, so
+they match alerts. The endpoints table shows each target's saved counts:
+`default` when both are unset, and otherwise that target's name with the counts
+it contributes (`api: 3 down, 2 up`, using 2 for a count it did not set). An
+open incident shows the shared reading for its URL, such as `3 down, 2 up`.
+It has no external resources, inserts saved values
 only as text, and is served with a strict Content Security Policy.
 
 There is no authentication or TLS. Keep the loopback default unless the network
@@ -347,7 +372,9 @@ first enabled; every event after it is owed an alert).
 Incidents and summaries are derived from `checks` on demand rather than stored,
 and checks are ordered by row ID rather than by timestamp, so a clock change
 can't reorder history. `connect` creates missing tables and columns, so
-databases from earlier versions upgrade in place.
+databases from earlier versions upgrade in place. A target saved before it
+could set incident thresholds gains null counts, which mean the default of 2
+and 2.
 
 Requests run on worker threads while the calling thread does every database
 write, which keeps SQLite on one connection. Deadlines (and webhook deliveries)
@@ -376,7 +403,9 @@ the watcher and its signal handling, incidents and their downtime bounds,
 summaries, alerts, webhook delivery, catching up on missed alerts, skipping
 incidents that already resolved, routing alerts per target, idempotency keys,
 webhook health and backoff, the API, the dashboard's headers and policy,
-upgrading older databases, and reading the database while a check is committed.
+upgrading older databases, per-target incident thresholds (invalid counts,
+overrides, resetting to the default, and alerts matching the incidents report),
+and reading the database while a check is committed.
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
@@ -390,7 +419,10 @@ resolved while no watcher was running, and a watcher with no webhook of its own
 sending a target's alert to that target's webhook while a muted target stays
 silent, a webhook that refuses alerts reported as failing with its queue, by
 host only in the API, and that webhook left alone for two intervals with
-`--max-backoff` but retried every round without it. Everything it creates is
+`--max-backoff` but retried every round without it, and a target whose failure
+count is 1 opening an incident (and a matching pending alert) after one down
+check while a target left at the default does not, until that override is
+cleared. Everything it creates is
 removed afterward.
 
 GitHub Actions runs `ruff check`, the unit tests and the reliability report on
@@ -447,7 +479,14 @@ same on every run; timings, and how many kills land and where, vary.
   alert after restarting (2 of 22 alerts in the crash scenario above). The
   repeat has the same idempotency key, but dropping it is up to the receiver;
   one that ignores the key acts twice.
-- Alerts use the default incident thresholds. Backoff is opt-in, so without
+- Changing a target's thresholds reinterprets its history and does not rewrite
+  alerts already sent. The alert log can list an opening the new counts no
+  longer call an incident, and an opening already sent is not sent again when
+  that same run of failures is still an incident. `incidents --failures` and
+  `--recoveries` reinterpret that one report only; alerts ignore them. Targets
+  that share a URL share one pair of counts, and a second override that
+  disagrees is rejected.
+- Backoff is opt-in, so without
   `--max-backoff` a failing webhook is retried every round while it has alerts
   queued; with it, alerts can wait past a webhook's recovery (22 rounds at
   most in the scenario above, where webhooks recover briefly mid-outage). The
@@ -491,5 +530,9 @@ Next:
    Done: `webhooks`, `/api/webhooks`, and the dashboard's webhook table.
 5. ~~Back off from a failing webhook instead of retrying it every round.~~
    Done: `watch --max-backoff`, with `retry_at` in `webhooks`.
-6. Let targets choose their own incident thresholds, for alerts as well as
-   reports.
+6. ~~Let targets choose their own incident thresholds, for alerts as well as
+   reports.~~ Done: `add`/`update --failures` and `--recoveries`, cleared with
+   `--no-failures` and `--no-recoveries`. Alerts and `incidents` (with no
+   counts given) use the saved ones.
+7. Pause a target so the watcher skips it without deleting its settings or
+   history.
