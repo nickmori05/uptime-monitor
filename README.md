@@ -72,6 +72,9 @@ python3 monitor.py update example --no-deadline
 python3 monitor.py update example --recoveries 1
 python3 monitor.py update example --no-failures --no-recoveries
 python3 monitor.py update example --alert-webhook https://hooks.example.com/team
+python3 monitor.py add held https://held.example/health --paused
+python3 monitor.py update held --pause
+python3 monitor.py update held --unpause
 python3 monitor.py run example
 python3 monitor.py targets
 python3 monitor.py remove example
@@ -94,6 +97,15 @@ count none of them set stays at 2, and saving a second override that disagrees
 is rejected. A URL no target checks (a bare `check`, or a target that was
 removed) uses 2 and 2.
 
+`add --paused` saves a target that `watch` and `run-all` will not check.
+`update --pause` and `update --unpause` change that later, and either can be
+combined with another setting. Pausing keeps the name, URL, timeout, deadline,
+webhook, and incident thresholds, and it keeps every check already saved.
+`targets` shows `"paused": true` or `false`. Reports still use a paused
+target's saved thresholds, and alerts already owed are still sent. `run NAME`
+still checks that one target. A URL that another, unpaused target also checks
+is still checked.
+
 ### Batches and the watcher
 
 ```sh
@@ -101,16 +113,19 @@ python3 monitor.py run-all --workers 4
 python3 monitor.py watch --interval 30 --deadline 15
 ```
 
-`run-all` checks every saved target once, at most `--workers` (1–32) at a time,
-and prints the results sorted by target name. It exits `1` if any target is down.
+`run-all` checks every saved target that is not paused, at most `--workers`
+(1–32) at a time, and prints the results sorted by target name. It exits `1` if
+any target is down.
 Each result is committed as soon as it arrives, so a failure or Ctrl+C keeps
 everything already saved.
 
 `watch` repeats `run-all`, waiting `--interval` seconds (1–86,400) after each
 round, and prints one JSON line per round. It reloads targets every round, so
-other terminals can add, update, or remove them while it runs. `--count N`
-stops after N rounds, and the exit code is `1` if any round saw a failure. It
-stops when no targets remain. Run one watcher per database.
+other terminals can add, update, remove, pause, or unpause them while it runs.
+`--count N` stops after N rounds, and the exit code is `1` if any round saw a
+failure. It stops when no targets remain. A round where every target is paused
+checks nothing, and the watcher keeps waiting, so unpausing one is picked up on
+the next round. Run one watcher per database.
 
 ### Incidents and summaries
 
@@ -313,7 +328,8 @@ GET requests for `/api/targets`, `/api/history`, `/api/summary`,
 matching commands and accept their filters as query parameters (URLs must be
 percent-encoded). The one difference is that webhook URLs often carry a secret
 token, so `/api/targets` shows a target's own webhook only as `"webhook"`, and
-`/api/webhooks` shows it as `"route": "webhook"` with its `host`. Invalid or
+`/api/webhooks` shows it as `"route": "webhook"` with its `host`. `paused` is
+included, the same `true` or `false` as the `targets` command. Invalid or
 unknown parameters return `400`, unknown paths `404`, and other methods `405`.
 
 `/` serves `dashboard.html`: a single static page that lists each target's
@@ -322,7 +338,8 @@ open incidents, and each alert webhook's health, and refreshes every 30 seconds.
 The open incidents are the ones `incidents` reports with no counts given, so
 they match alerts. The endpoints table shows each target's saved counts:
 `default` when both are unset, and otherwise that target's name with the counts
-it contributes (`api: 3 down, 2 up`, using 2 for a count it did not set). An
+it contributes (`api: 3 down, 2 up`, using 2 for a count it did not set). A
+paused target's name is shown with `(paused)`. An
 open incident shows the shared reading for its URL, such as `3 down, 2 up`.
 It has no external resources, inserts saved values
 only as text, and is served with a strict Content Security Policy.
@@ -374,7 +391,8 @@ and checks are ordered by row ID rather than by timestamp, so a clock change
 can't reorder history. `connect` creates missing tables and columns, so
 databases from earlier versions upgrade in place. A target saved before it
 could set incident thresholds gains null counts, which mean the default of 2
-and 2.
+and 2. A target saved before it could be paused gains `paused` 0, so the
+watcher still checks it.
 
 Requests run on worker threads while the calling thread does every database
 write, which keeps SQLite on one connection. Deadlines (and webhook deliveries)
@@ -405,6 +423,9 @@ incidents that already resolved, routing alerts per target, idempotency keys,
 webhook health and backoff, the API, the dashboard's headers and policy,
 upgrading older databases, per-target incident thresholds (invalid counts,
 overrides, resetting to the default, and alerts matching the incidents report),
+pausing a target (`watch` and `run-all` skip it, `run` still checks it, its
+settings and history stay, an older database gains the column unpaused, and an
+alert already owed is still sent),
 and reading the database while a check is committed.
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
@@ -422,7 +443,9 @@ host only in the API, and that webhook left alone for two intervals with
 `--max-backoff` but retried every round without it, and a target whose failure
 count is 1 opening an incident (and a matching pending alert) after one down
 check while a target left at the default does not, until that override is
-cleared. Everything it creates is
+cleared, and a paused target left out of `watch` and `run-all`, checked by
+`run` while it stays paused, then checked again on the next `watch` round after
+it is unpaused. Everything it creates is
 removed afterward.
 
 GitHub Actions runs `ruff check`, the unit tests and the reliability report on
@@ -479,6 +502,11 @@ same on every run; timings, and how many kills land and where, vary.
   alert after restarting (2 of 22 alerts in the crash scenario above). The
   repeat has the same idempotency key, but dropping it is up to the receiver;
   one that ignores the key acts twice.
+- Pausing a target keeps it out of `watch` and `run-all` until `update --unpause`.
+  `run NAME` still checks it. A URL that another, unpaused target also checks is
+  still checked. While a URL is not checked, an open incident stays open, and
+  alerts already owed to its webhooks are still sent. A paused target still
+  counts when targets that share a URL must agree on incident thresholds.
 - Changing a target's thresholds reinterprets its history and does not rewrite
   alerts already sent. The alert log can list an opening the new counts no
   longer call an incident, and an opening already sent is not sent again when
@@ -515,8 +543,8 @@ same on every run; timings, and how many kills land and where, vary.
 ## Roadmap
 
 Earlier milestones (the API and dashboard, deduplicated alerts with measured
-reliability, saved deadlines, and downtime bounds for each incident) are done.
-Next:
+reliability, saved deadlines, and downtime bounds for each incident) are done,
+and so are these:
 
 1. ~~Give every alert an idempotency key so receivers can drop repeats.~~ Done:
    `idempotency_key` and the `Idempotency-Key` header.
@@ -534,5 +562,6 @@ Next:
    reports.~~ Done: `add`/`update --failures` and `--recoveries`, cleared with
    `--no-failures` and `--no-recoveries`. Alerts and `incidents` (with no
    counts given) use the saved ones.
-7. Pause a target so the watcher skips it without deleting its settings or
-   history.
+7. ~~Pause a target so the watcher skips it without deleting its settings or
+   history.~~ Done: `add --paused` and `update --pause` / `--unpause`. `watch`
+   and `run-all` leave a paused target out; `run NAME` still checks it.

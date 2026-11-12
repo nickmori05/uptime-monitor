@@ -30,6 +30,7 @@ ALERT_WEBHOOK_COLUMN = ("TEXT NOT NULL DEFAULT 'default' CHECK(alert_webhook IN 
                         "OR alert_webhook LIKE 'http://%' OR alert_webhook LIKE 'https://%')")
 FAILURES_COLUMN = "INTEGER CHECK(failures IS NULL OR (failures >= 1 AND failures <= 100))"
 RECOVERIES_COLUMN = "INTEGER CHECK(recoveries IS NULL OR (recoveries >= 1 AND recoveries <= 100))"
+PAUSED_COLUMN = "INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1))"
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,27 @@ def validate_alert_webhook(value: str) -> str:
         return validate_url(value)
     except ValueError as error:
         raise ValueError(f"Alert webhook must be default, none, or a webhook URL. {error}") from error
+
+
+def validate_paused(paused: bool) -> bool:
+    """Return the pause flag if it is a boolean, else raise ValueError."""
+    if type(paused) is not bool:
+        raise ValueError("Paused must be true or false.")
+    return paused
+
+
+def _as_paused(value) -> bool:
+    """Return a stored pause flag as a boolean, or raise ValueError if it is not 0 or 1."""
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    raise ValueError("Paused must be true or false.")
+
+
+def _target(row: sqlite3.Row) -> dict:
+    """Return one saved target, with `paused` as a boolean."""
+    target = dict(row)
+    target["paused"] = _as_paused(target["paused"])
+    return target
 
 
 def request_status(url: str, timeout: float) -> tuple[int | None, str | None]:
@@ -191,7 +213,8 @@ def connect(database: Path) -> sqlite3.Connection:
             deadline REAL CHECK(deadline IS NULL OR (deadline > 0 AND deadline <= 60)),
             alert_webhook {ALERT_WEBHOOK_COLUMN},
             failures {FAILURES_COLUMN},
-            recoveries {RECOVERIES_COLUMN}
+            recoveries {RECOVERIES_COLUMN},
+            paused {PAUSED_COLUMN}
         )"""
     )
     # Databases created before targets had a saved deadline gain the column empty.
@@ -207,6 +230,9 @@ def connect(database: Path) -> sqlite3.Connection:
         connection.execute(f"ALTER TABLE targets ADD COLUMN failures {FAILURES_COLUMN}")
     if "recoveries" not in columns:
         connection.execute(f"ALTER TABLE targets ADD COLUMN recoveries {RECOVERIES_COLUMN}")
+    # Targets saved before they could be paused stay active, so a watcher still checks them.
+    if "paused" not in columns:
+        connection.execute(f"ALTER TABLE targets ADD COLUMN paused {PAUSED_COLUMN}")
     connection.execute("CREATE INDEX IF NOT EXISTS checks_url_id ON checks(url, id)")
     # One row per incident event, so an alert is never sent twice for the same change.
     connection.execute(
@@ -330,8 +356,8 @@ def _require_agreement(connection: sqlite3.Connection, name: str, url: str,
 
 def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: float = 5.0,
                deadline: float | None = None, alert_webhook: str = routing.DEFAULT,
-               failures: int | None = None, recoveries: int | None = None) -> dict:
-    """Save a new named target without checking it."""
+               failures: int | None = None, recoveries: int | None = None, paused: bool = False) -> dict:
+    """Save a new named target without checking it. A paused target is skipped by `watch` and `run-all`."""
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
         raise ValueError("Name must be 1–64 letters, digits, hyphens, or underscores, starting with a letter or digit.")
     url = validate_url(url)
@@ -342,17 +368,18 @@ def add_target(connection: sqlite3.Connection, name: str, url: str, timeout: flo
         failures = validate_count("Failures", failures)
     if recoveries is not None:
         recoveries = validate_count("Recoveries", recoveries)
+    paused = validate_paused(paused)
     try:
         with connection:
             _require_agreement(connection, name, url, failures, recoveries)
             connection.execute(
-                """INSERT INTO targets (name, url, timeout, deadline, alert_webhook, failures, recoveries)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (name, url, timeout, deadline, alert_webhook, failures, recoveries))
+                """INSERT INTO targets (name, url, timeout, deadline, alert_webhook, failures, recoveries, paused)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (name, url, timeout, deadline, alert_webhook, failures, recoveries, int(paused)))
     except sqlite3.IntegrityError as error:
         raise ValueError(f"A target named '{name}' already exists.") from error
     return {"name": name, "url": url, "timeout": timeout, "deadline": deadline, "alert_webhook": alert_webhook,
-            "failures": failures, "recoveries": recoveries}
+            "failures": failures, "recoveries": recoveries, "paused": paused}
 
 
 def get_target(connection: sqlite3.Connection, name: str) -> dict:
@@ -360,12 +387,12 @@ def get_target(connection: sqlite3.Connection, name: str) -> dict:
     row = connection.execute("SELECT * FROM targets WHERE name = ?", (name,)).fetchone()
     if row is None:
         raise ValueError(f"Target '{name}' does not exist.")
-    return dict(row)
+    return _target(row)
 
 
 def list_targets(connection: sqlite3.Connection) -> list[dict]:
     """Return every saved target, sorted by name."""
-    return [dict(row) for row in connection.execute("SELECT * FROM targets ORDER BY name")]
+    return [_target(row) for row in connection.execute("SELECT * FROM targets ORDER BY name")]
 
 
 def update_target(connection: sqlite3.Connection, name: str, *,
@@ -373,11 +400,12 @@ def update_target(connection: sqlite3.Connection, name: str, *,
                   deadline: float | None = None, clear_deadline: bool = False,
                   alert_webhook: str | None = None,
                   failures: int | None = None, clear_failures: bool = False,
-                  recoveries: int | None = None, clear_recoveries: bool = False) -> dict:
-    """Change a saved target's URL, timeout, deadline, alert webhook, or incident thresholds.
+                  recoveries: int | None = None, clear_recoveries: bool = False,
+                  paused: bool | None = None) -> dict:
+    """Change a saved target's URL, timeout, deadline, alert webhook, incident thresholds, or pause flag.
 
     Settings that aren't given are kept. Clearing a threshold puts that count back
-    at the default.
+    at the default. Pausing leaves the target's settings and history in place.
     """
     if deadline is not None and clear_deadline:
         raise ValueError("Choose either a new deadline or clearing it, not both.")
@@ -386,8 +414,10 @@ def update_target(connection: sqlite3.Connection, name: str, *,
     if recoveries is not None and clear_recoveries:
         raise ValueError("Choose either a new recovery threshold or clearing it, not both.")
     if (url is None and timeout is None and deadline is None and not clear_deadline and alert_webhook is None
-            and failures is None and not clear_failures and recoveries is None and not clear_recoveries):
-        raise ValueError("Provide a URL, timeout, deadline, alert webhook, or incident threshold to update.")
+            and failures is None and not clear_failures and recoveries is None and not clear_recoveries
+            and paused is None):
+        raise ValueError(
+            "Provide a URL, timeout, deadline, alert webhook, incident threshold, or pause state to update.")
     if alert_webhook is not None:
         alert_webhook = validate_alert_webhook(alert_webhook)
     if url is not None:
@@ -399,6 +429,8 @@ def update_target(connection: sqlite3.Connection, name: str, *,
         failures = validate_count("Failures", failures)
     if recoveries is not None:
         recoveries = validate_count("Recoveries", recoveries)
+    if paused is not None:
+        paused = validate_paused(paused)
     with connection:
         current = get_target(connection, name)
         new_url = current["url"] if url is None else url
@@ -410,10 +442,12 @@ def update_target(connection: sqlite3.Connection, name: str, *,
                deadline = CASE WHEN ? THEN NULL ELSE COALESCE(?, deadline) END,
                alert_webhook = COALESCE(?, alert_webhook),
                failures = CASE WHEN ? THEN NULL ELSE COALESCE(?, failures) END,
-               recoveries = CASE WHEN ? THEN NULL ELSE COALESCE(?, recoveries) END
+               recoveries = CASE WHEN ? THEN NULL ELSE COALESCE(?, recoveries) END,
+               paused = COALESCE(?, paused)
                WHERE name = ?""",
             (url, timeout, clear_deadline, deadline, alert_webhook,
-             clear_failures, failures, clear_recoveries, recoveries, name),
+             clear_failures, failures, clear_recoveries, recoveries,
+             None if paused is None else int(paused), name),
         )
         if cursor.rowcount == 0:
             raise ValueError(f"Target '{name}' does not exist.")
@@ -438,7 +472,7 @@ def target_deadline(target: dict, override: float | None = None) -> float | None
 
 def run_targets(connection: sqlite3.Connection, workers: int = 4,
                 deadline: float | None = None) -> list[dict]:
-    """Check every saved target once, `workers` at a time, saving each result on this connection."""
+    """Check every saved target that is not paused once, `workers` at a time, saving each result here."""
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("Workers must be between 1 and 32.")
     deadline = validate_deadline(deadline)
@@ -447,6 +481,7 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4,
         validate_url(target["url"])
         validate_timeout(target["timeout"])
         validate_deadline(target["deadline"])
+    targets = [target for target in targets if not target["paused"]]
     if not targets:
         return []
     pool = ThreadPoolExecutor(max_workers=workers)
@@ -467,7 +502,11 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4,
 
 def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
                   count: int | None = None, workers: int = 4, deadline: float | None = None):
-    """Yield one batch of results per round, waiting `interval` seconds between rounds."""
+    """Yield one batch of results per round, waiting `interval` seconds between rounds.
+
+    Paused targets are left out of each round. The watcher stops when no targets
+    remain, and keeps waiting while every remaining target is paused.
+    """
     if (isinstance(interval, bool) or not isinstance(interval, (int, float))
             or not math.isfinite(interval) or not 1 <= interval <= 86400):
         raise ValueError("Interval must be between 1 and 86400 seconds.")
@@ -478,10 +517,13 @@ def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
     deadline = validate_deadline(deadline)
     cycle = 0
     while True:
+        # Stop only when nothing is saved. A round that checks nothing because every
+        # target is paused still waits, so unpausing one is picked up next round.
+        remaining = list_targets(connection)
         results = run_targets(connection, workers, deadline)
         cycle += 1
         yield {"cycle": cycle, "results": results}
-        if not results or (count is not None and cycle >= count):
+        if not remaining or (count is not None and cycle >= count):
             return
         sleep(interval)
 
@@ -534,8 +576,10 @@ def parser() -> argparse.ArgumentParser:
                      help="Consecutive failures before this target's incidents open (default: 2)")
     add.add_argument("--recoveries", type=int,
                      help="Consecutive successes before this target's incidents resolve (default: 2)")
+    add.add_argument("--paused", action="store_true",
+                     help="Save the target paused, so watch and run-all skip it")
     update = commands.add_parser(
-        "update", help="Change a saved target's URL, timeout, deadline, alert webhook, or incident thresholds")
+        "update", help="Change a saved target's URL, timeout, deadline, alert webhook, thresholds, or pause state")
     update.add_argument("name")
     update.add_argument("--url", help="Save a new URL")
     update.add_argument("--timeout", type=float, help="Save a new socket timeout")
@@ -551,16 +595,21 @@ def parser() -> argparse.ArgumentParser:
                                    help="Save how many consecutive successes resolve an incident")
     update_recoveries.add_argument("--no-recoveries", action="store_true",
                                    help="Use the default of 2 consecutive successes")
+    update_pause = update.add_mutually_exclusive_group()
+    update_pause.add_argument("--pause", action="store_true",
+                              help="Skip this target in watch and run-all until it is unpaused")
+    update_pause.add_argument("--unpause", action="store_true",
+                              help="Check this target in watch and run-all again")
     commands.add_parser("targets", help="List saved targets")
     remove = commands.add_parser("remove", help="Remove a saved target without deleting its history")
     remove.add_argument("name")
-    run = commands.add_parser("run", help="Check one saved target and record the result")
+    run = commands.add_parser("run", help="Check one saved target and record the result, including when it is paused")
     run.add_argument("name")
     run.add_argument("--deadline", type=float, help="Override the target's saved deadline for this run")
-    batch = commands.add_parser("run-all", help="Check all saved targets with bounded concurrency")
+    batch = commands.add_parser("run-all", help="Check saved targets that are not paused, with bounded concurrency")
     batch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
     batch.add_argument("--deadline", type=float, help="Per-request limit for every target, overriding saved deadlines")
-    watch = commands.add_parser("watch", help="Repeat batches until stopped or the count is reached")
+    watch = commands.add_parser("watch", help="Repeat checks of targets that are not paused")
     watch.add_argument("--workers", type=int, default=4, help="Concurrent requests, 1–32 (default: 4)")
     watch.add_argument("--interval", type=float, default=30.0, help="Seconds to wait after each batch")
     watch.add_argument("--count", type=int, help="Number of batches; omit to keep watching")
@@ -654,18 +703,25 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "add":
                 target = add_target(connection, args.name, args.url, args.timeout, args.deadline,
-                                    args.alert_webhook, args.failures, args.recoveries)
+                                    args.alert_webhook, args.failures, args.recoveries, args.paused)
                 print(json.dumps(target, indent=2))
                 return 0
             if args.command == "targets":
                 print(json.dumps(list_targets(connection), indent=2))
                 return 0
             if args.command == "update":
+                if args.pause:
+                    paused = True
+                elif args.unpause:
+                    paused = False
+                else:
+                    paused = None
                 target = update_target(connection, args.name, url=args.url, timeout=args.timeout,
                                        deadline=args.deadline, clear_deadline=args.no_deadline,
                                        alert_webhook=args.alert_webhook,
                                        failures=args.failures, clear_failures=args.no_failures,
-                                       recoveries=args.recoveries, clear_recoveries=args.no_recoveries)
+                                       recoveries=args.recoveries, clear_recoveries=args.no_recoveries,
+                                       paused=paused)
                 print(json.dumps(target, indent=2))
                 return 0
             if args.command == "remove":

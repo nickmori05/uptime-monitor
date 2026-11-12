@@ -44,7 +44,7 @@ class TargetThresholdTests(unittest.TestCase):
         code, output = self.cli("add", "api", "https://example.com", "--failures", "3", "--recoveries", "4")
         self.assertEqual(code, 0)
         expected = {"name": "api", "url": "https://example.com", "timeout": 5, "deadline": None,
-                    "alert_webhook": "default", "failures": 3, "recoveries": 4}
+                    "alert_webhook": "default", "failures": 3, "recoveries": 4, "paused": False}
         self.assertEqual(json.loads(output), expected)
         reopened = monitor.connect(self.database)
         self.addCleanup(reopened.close)
