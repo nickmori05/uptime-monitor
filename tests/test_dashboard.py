@@ -72,6 +72,8 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("recoveries=", incidents[0])
         self.assertIn("target.failures", self.page)
         self.assertIn("incident.failures", self.page)
+        self.assertIn("target.paused", self.page)
+        self.assertIn("(paused)", self.page)
         self.assertIn(">Threshold<", self.page)
         for path in paths:
             with self.subTest(path=path):

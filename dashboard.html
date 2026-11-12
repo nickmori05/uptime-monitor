@@ -47,6 +47,7 @@ td.url { overflow-wrap: anywhere; min-width: 14em; }
 
 <p class="note">Saved observations from the last 100 checks per URL, refreshed every 30 seconds.
 Open incidents use each target's saved thresholds, the same ones alerts use.
+A target marked (paused) is kept, with its settings and history, and is not checked until unpaused.
 Observations describe past checks, not whether an endpoint is up right now.</p>
 
 <script>
@@ -89,6 +90,10 @@ function latest(summary) {
   return [`${summary.latest_state}${detail ? ` (${detail})` : ""}`, summary.latest_state];
 }
 
+function targetLabel(target) {
+  return target.paused ? `${target.name} (paused)` : target.name;
+}
+
 function thresholdText(target) {
   if (target.failures == null && target.recoveries == null) return "default";
   const down = target.failures == null ? 2 : target.failures;
@@ -113,7 +118,7 @@ async function refresh() {
     }
     const endpoints = [...byUrl].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     fill("endpoints", endpoints, ([url, { summary, targets: group }]) => [
-      [group.map((target) => target.name).join(", ") || "—"],
+      [group.map(targetLabel).join(", ") || "—"],
       [thresholdLabel(group)],
       [url, "url"],
       latest(summary),

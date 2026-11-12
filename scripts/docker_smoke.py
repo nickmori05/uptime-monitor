@@ -218,6 +218,32 @@ def main():
         listed = {row["name"]: row["failures"] for row in json.loads(command("targets"))}
         assert listed["touchy"] is None, listed
         print("Per-target incident thresholds passed.", flush=True)
+
+        # A paused target is left out of watch and run-all, and run still checks it.
+        # Unpausing puts it back in the next round. The check made while it was paused stays.
+        hold = "http://fixture:8000/hold"
+        added = json.loads(command("add", "hold", hold, "--timeout", "2", "--paused"))
+        assert added["paused"] is True and added["timeout"] == 2, added
+        command("watch", "--interval", "1", "--count", "1", expected=1)
+        command("run-all", expected=1)
+        assert json.loads(command("history", "--url", hold, "--limit", "100")) == []
+        checked = json.loads(command("run", "hold", expected=1))
+        assert (checked["state"], checked["url"], checked["error"]) == ("down", hold, "http_404"), checked
+        history = json.loads(command("history", "--url", hold, "--limit", "100"))
+        assert [row["id"] for row in history] == [checked["id"]], history
+        command("update", "hold", "--unpause")
+        command("watch", "--interval", "1", "--count", "1", expected=1)
+        history = json.loads(command("history", "--url", hold, "--limit", "100"))
+        assert len(history) == 2 and history[-1]["id"] == checked["id"], history
+        listed = {row["name"]: row["paused"] for row in json.loads(command("targets"))}
+        assert listed["hold"] is False, listed
+        command("update", "hold", "--pause")
+        served = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/targets"]))
+        hold_row = next(row for row in served if row["name"] == "hold")
+        assert hold_row["paused"] is True and hold_row["url"] == hold and hold_row["timeout"] == 2, hold_row
+        assert [row["id"] for row in json.loads(command("history", "--url", hold, "--limit", "100"))] == [
+            row["id"] for row in history], hold_row
+        print("Pausing a target passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)

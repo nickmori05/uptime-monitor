@@ -28,7 +28,7 @@ class TargetDeadlineTests(unittest.TestCase):
         code, output = self.cli("add", "api", "https://example.com", "--timeout", "3", "--deadline", "10")
         self.assertEqual(code, 0)
         expected = {"name": "api", "url": "https://example.com", "timeout": 3, "deadline": 10,
-                    "alert_webhook": "default", "failures": None, "recoveries": None}
+                    "alert_webhook": "default", "failures": None, "recoveries": None, "paused": False}
         self.assertEqual(json.loads(output), expected)
         reopened = monitor.connect(self.database)
         self.addCleanup(reopened.close)
