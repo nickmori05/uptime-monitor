@@ -112,7 +112,7 @@ def main():
         assert (served["stored_checks"], served["latest_state"]) == (6, "up"), served
         assert json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/incidents"])) == [incident]
         page = run(["exec", "-T", "fixture", "python", "-c", fetch, f"http://{project}-api:8080/"])
-        assert "<title>Uptime Monitor</title>" in page and "/api/summary" in page, page[:200]
+        assert "<title>Uptime Monitor</title>" in page and "/api/summary" in page and "/api/watcher" in page, page[:200]
         assert len(json.loads(command("history", "--limit", "100"))) == 7
         print("Read-only API and dashboard passed.", flush=True)
 
@@ -244,6 +244,18 @@ def main():
         assert [row["id"] for row in json.loads(command("history", "--url", hold, "--limit", "100"))] == [
             row["id"] for row in history], hold_row
         print("Pausing a target passed.", flush=True)
+
+        # That watch was one round and then stopped. The report and the API both say so.
+        heartbeat = json.loads(command("watcher"))
+        assert (heartbeat["state"], heartbeat["phase"], heartbeat["rounds"], heartbeat["interval"]) == (
+            "stopped", "stopped", 1, 1), heartbeat
+        assert heartbeat["late"] is False and heartbeat["due_at"] is None, heartbeat
+        assert heartbeat["quiet_seconds"] >= 0, heartbeat
+        served = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/watcher"]))
+        assert {key: served[key] for key in served if key != "quiet_seconds"} == {
+            key: heartbeat[key] for key in heartbeat if key != "quiet_seconds"}, (served, heartbeat)
+        assert served["quiet_seconds"] >= heartbeat["quiet_seconds"], served
+        print("Watcher heartbeat passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)

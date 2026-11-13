@@ -38,7 +38,7 @@ options.
 | `add`, `update`, `remove`, `targets` | Manage named targets with saved settings. |
 | `run NAME`, `run-all` | Check one or every saved target once. |
 | `watch` | Check every saved target in repeated rounds, optionally sending alerts. |
-| `history`, `summary`, `incidents`, `alerts`, `webhooks` | Report on saved results without making requests. |
+| `history`, `summary`, `incidents`, `alerts`, `webhooks`, `watcher` | Report on saved results without making requests. |
 | `serve` | Serve the read-only JSON API and dashboard. |
 
 ### Checks
@@ -126,6 +126,40 @@ other terminals can add, update, remove, pause, or unpause them while it runs.
 failure. It stops when no targets remain. A round where every target is paused
 checks nothing, and the watcher keeps waiting, so unpausing one is picked up on
 the next round. Run one watcher per database.
+
+### Whether the watcher is running
+
+```sh
+python3 monitor.py watcher
+```
+
+```json
+{"state": "running", "phase": "waiting", "interval": 30.0,
+ "started_at": "2026-11-13T12:00:00+00:00", "beat_at": "2026-11-13T12:01:02+00:00",
+ "rounds": 2, "due_at": "2026-11-13T12:01:32+00:00", "late": false, "quiet_seconds": 4}
+```
+
+`watch` replaces one database row when it starts a round, when that round's checks
+finish, when the wait begins, and when it exits. `watcher` reads the row and
+makes no request. `state` is `absent` when no watcher has written it, `running`
+while one has, and `stopped` after an exit Python can unwind: the count was
+reached, no targets remain, Ctrl+C or SIGTERM, or a round raised. `phase` is
+`checking` from the start of a round until the wait begins (the alert delivery
+after the checks is still `checking`, since a delivery has no promised end) and
+`waiting` during the interval. `rounds` counts rounds whose checks have
+finished. `due_at` is set only while `waiting`, and it is one interval after
+`beat_at`: the moment the next round's checks are due to start. `late` is true
+only when that moment has passed. `quiet_seconds` is the whole seconds since
+`beat_at`, rounded down, or 0 when the clock is behind `beat_at`.
+
+A round that checks nothing because every target is paused still beats, so the
+row shows the watcher is alive when history is not growing. `run` and `run-all`
+do not write it. The next `watch` replaces the row; it is the latest run, not a
+log of earlier ones. A kill that does not unwind (SIGKILL) leaves whatever beat
+was written last. That is `late` only if the watcher was already `waiting`.
+Killed during `checking`, it stays `checking` and `quiet_seconds` grows, which
+is also what a slow round looks like: a check without a deadline can sit in
+DNS, and a round of many slow checks has no promised end.
 
 ### Incidents and summaries
 
@@ -324,7 +358,7 @@ curl 'http://127.0.0.1:8080/api/history?limit=5&url=https%3A%2F%2Fexample.com'
 
 `serve` listens on `127.0.0.1:8080` (`--port 0` picks a free port). It answers
 GET requests for `/api/targets`, `/api/history`, `/api/summary`,
-`/api/incidents`, and `/api/webhooks`, which return the same JSON as the
+`/api/incidents`, `/api/webhooks`, and `/api/watcher`, which return the same JSON as the
 matching commands and accept their filters as query parameters (URLs must be
 percent-encoded). The one difference is that webhook URLs often carry a secret
 token, so `/api/targets` shows a target's own webhook only as `"webhook"`, and
@@ -334,7 +368,8 @@ unknown parameters return `400`, unknown paths `404`, and other methods `405`.
 
 `/` serves `dashboard.html`: a single static page that lists each target's
 latest result, recent up/down counts, average latency, incident thresholds,
-open incidents, and each alert webhook's health, and refreshes every 30 seconds.
+open incidents, and each alert webhook's health, says whether the watcher is
+checking, waiting, late, or stopped, and refreshes every 30 seconds.
 The open incidents are the ones `incidents` reports with no counts given, so
 they match alerts. The endpoints table shows each target's saved counts:
 `default` when both are unset, and otherwise that target's name with the counts
@@ -379,20 +414,23 @@ container itself. To send alerts, add `--alert-webhook URL` to the service
   reports webhook health.
 - `api.py` and `dashboard.html`: the read-only HTTP API and the static dashboard.
 
-All state lives in one SQLite file with six tables: `checks` (one row per
+All state lives in one SQLite file with seven tables: `checks` (one row per
 observation), `targets`, `alerts` (one row per sent or skipped incident event,
 unique per event), `deliveries` (one row per webhook route an event reached),
 `webhooks` (one row per route that was ever tried, with its latest outcomes and
 any retry time),
-and `alerting` (a single row saving the last check from before alerts were
-first enabled; every event after it is owed an alert).
+`alerting` (a single row saving the last check from before alerts were
+first enabled; every event after it is owed an alert),
+and `watcher` (a single row for the latest `watch` run, replaced when the next
+one starts).
 Incidents and summaries are derived from `checks` on demand rather than stored,
 and checks are ordered by row ID rather than by timestamp, so a clock change
 can't reorder history. `connect` creates missing tables and columns, so
 databases from earlier versions upgrade in place. A target saved before it
 could set incident thresholds gains null counts, which mean the default of 2
 and 2. A target saved before it could be paused gains `paused` 0, so the
-watcher still checks it.
+watcher still checks it. A database from before the watcher heartbeat gains an
+empty `watcher` table, which reads as `absent`.
 
 Requests run on worker threads while the calling thread does every database
 write, which keeps SQLite on one connection. Deadlines (and webhook deliveries)
@@ -426,7 +464,10 @@ overrides, resetting to the default, and alerts matching the incidents report),
 pausing a target (`watch` and `run-all` skip it, `run` still checks it, its
 settings and history stay, an older database gains the column unpaused, and an
 alert already owed is still sent),
-and reading the database while a check is committed.
+and reading the database while a check is committed, and the watcher heartbeat
+(a paused fleet still beats, a wait past `due_at` is `late`, a check in progress
+is not, `run` and `run-all` do not write the row, an older database reads as
+`absent`, and Ctrl+C or SIGTERM records `stopped`).
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
@@ -445,7 +486,8 @@ count is 1 opening an incident (and a matching pending alert) after one down
 check while a target left at the default does not, until that override is
 cleared, and a paused target left out of `watch` and `run-all`, checked by
 `run` while it stays paused, then checked again on the next `watch` round after
-it is unpaused. Everything it creates is
+it is unpaused, and after that watch the `watcher` report is `stopped` with
+that one round, which `/api/watcher` agrees with. Everything it creates is
 removed afterward.
 
 GitHub Actions runs `ruff check`, the unit tests and the reliability report on
@@ -502,6 +544,13 @@ same on every run; timings, and how many kills land and where, vary.
   alert after restarting (2 of 22 alerts in the crash scenario above). The
   repeat has the same idempotency key, but dropping it is up to the receiver;
   one that ignores the key acts twice.
+- The watcher heartbeat is one row, replaced by the next `watch`, so it is not
+  a history of runs. A second watcher on the same database overwrites it; run
+  one watcher per database. `late` means a wait has passed `due_at`. A round
+  that is still `checking` is never `late`: `quiet_seconds` grows for a healthy
+  slow round and for a process killed mid-round, and the report does not tell
+  those apart. `run` and `run-all` do not beat. A clock set back reports
+  `quiet_seconds` 0 and is not `late` until the clock passes `due_at`.
 - Pausing a target keeps it out of `watch` and `run-all` until `update --unpause`.
   `run NAME` still checks it. A URL that another, unpaused target also checks is
   still checked. While a URL is not checked, an open incident stays open, and
@@ -565,3 +614,9 @@ and so are these:
 7. ~~Pause a target so the watcher skips it without deleting its settings or
    history.~~ Done: `add --paused` and `update --pause` / `--unpause`. `watch`
    and `run-all` leave a paused target out; `run NAME` still checks it.
+8. ~~Record whether the watcher is running, and when a finished round's wait
+   has already passed.~~ Done: `watcher` and `/api/watcher`. The written list
+   ended at pausing a target. This follows that: once every target can be
+   paused, a live watcher may save no checks, so the check history cannot show
+   that it is still running, and a watcher that dies during its wait leaves
+   those checks looking merely old.

@@ -65,7 +65,12 @@ class DashboardTests(unittest.TestCase):
         monitor.save(self.connection, monitor.Check(
             "https://example.com", "2026-10-15T12:00:00+00:00", "down", None, 3000.0, "timeout"))
         paths = re.findall(r'"(/api/[^"]*)"', self.page)
-        self.assertEqual(len(paths), 4, paths)
+        self.assertEqual(len(paths), 5, paths)
+        self.assertIn("/api/watcher", paths)
+        self.assertIn('id="watcher"', self.page)
+        self.assertIn("No watcher has run.", self.page)
+        self.assertIn("Watcher is late.", self.page)
+        self.assertIn("textContent", self.page)
         incidents = [path for path in paths if "incidents" in path]
         self.assertEqual(incidents, ["/api/incidents?state=open&limit=100"])
         self.assertNotIn("failures=", incidents[0])
