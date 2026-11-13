@@ -74,6 +74,7 @@ def routes(store) -> dict:
         "/api/incidents": (("url", "state", "limit", "failures", "recoveries"), incidents),
         "/api/webhooks": ((), lambda connection, query: [routing.public_webhook(row)
                                                           for row in alerts.webhook_health(connection)]),
+        "/api/watcher": ((), lambda connection, query: store.watcher_status(connection)),
     }
 
 

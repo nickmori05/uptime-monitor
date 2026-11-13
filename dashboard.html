@@ -25,6 +25,7 @@ td.url { overflow-wrap: anywhere; min-width: 14em; }
 <body>
 <h1>Uptime Monitor</h1>
 <p id="status">Loading saved results…</p>
+<p id="watcher"></p>
 <p id="error" role="alert"></p>
 
 <h2>Endpoints</h2>
@@ -47,6 +48,7 @@ td.url { overflow-wrap: anywhere; min-width: 14em; }
 
 <p class="note">Saved observations from the last 100 checks per URL, refreshed every 30 seconds.
 Open incidents use each target's saved thresholds, the same ones alerts use.
+The watcher line reads the heartbeat from the last watch run: checking, waiting, late, or stopped.
 A target marked (paused) is kept, with its settings and history, and is not checked until unpaused.
 Observations describe past checks, not whether an endpoint is up right now.</p>
 
@@ -84,6 +86,25 @@ async function load(path) {
   return body;
 }
 
+function roundsText(count) {
+  if (count === 0) return "before finishing a round";
+  if (count === 1) return "after 1 round";
+  return `after ${count} rounds`;
+}
+
+function describeWatcher(watcher) {
+  if (watcher.state === "absent") return ["No watcher has run.", ""];
+  const beat = when(watcher.beat_at);
+  if (watcher.state === "stopped") return [`Watcher stopped ${roundsText(watcher.rounds)}. Last beat ${beat}.`, ""];
+  if (watcher.late) return [`Watcher is late. The next round was due ${when(watcher.due_at)}.`, "down"];
+  if (watcher.phase === "waiting") {
+    return [`Watcher is waiting ${roundsText(watcher.rounds)}. Next round by ${when(watcher.due_at)}.`, "up"];
+  }
+  const quiet = watcher.quiet_seconds === 1 ? "1 second" : `${watcher.quiet_seconds} seconds`;
+  const progress = watcher.rounds === 0 ? "its first round" : roundsText(watcher.rounds);
+  return [`Watcher is checking ${progress}. Last beat ${quiet} ago.`, "up"];
+}
+
 function latest(summary) {
   if (!summary) return ["not checked yet"];
   const detail = summary.latest_error || summary.latest_status_code;
@@ -109,8 +130,13 @@ function thresholdLabel(group) {
 
 async function refresh() {
   try {
-    const [targets, summaries, incidents, webhooks] = await Promise.all(
-      ["/api/targets", "/api/summary", "/api/incidents?state=open&limit=100", "/api/webhooks"].map(load));
+    const [targets, summaries, incidents, webhooks, watcher] = await Promise.all(
+      ["/api/targets", "/api/summary", "/api/incidents?state=open&limit=100", "/api/webhooks",
+       "/api/watcher"].map(load));
+    const [watcherText, watcherClass] = describeWatcher(watcher);
+    const watcherLine = document.getElementById("watcher");
+    watcherLine.textContent = watcherText;
+    watcherLine.className = watcherClass;
     const byUrl = new Map(summaries.map((summary) => [summary.url, { summary, targets: [] }]));
     for (const target of targets) {
       if (!byUrl.has(target.url)) byUrl.set(target.url, { summary: null, targets: [] });

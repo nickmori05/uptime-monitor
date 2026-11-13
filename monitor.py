@@ -4,7 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import http.client
 import json
 import math
@@ -280,6 +280,23 @@ def connect(database: Path) -> sqlite3.Connection:
     # Webhook health saved before backoff has no retry time, so every webhook is tried next round.
     if "retry_at" not in {row["name"] for row in connection.execute("PRAGMA table_info(webhooks)")}:
         connection.execute("ALTER TABLE webhooks ADD COLUMN retry_at TEXT")
+    # One row for the latest watch run. A database from before this reads as absent.
+    # The checks tie `waiting` to a due time and `stopped` to that phase, so a beat
+    # cannot claim a deadline it does not have.
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS watcher (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            state TEXT NOT NULL CHECK(state IN ('running', 'stopped')),
+            phase TEXT NOT NULL CHECK(phase IN ('checking', 'waiting', 'stopped')),
+            interval REAL NOT NULL CHECK(interval >= 1 AND interval <= 86400),
+            started_at TEXT NOT NULL,
+            beat_at TEXT NOT NULL,
+            rounds INTEGER NOT NULL CHECK(rounds >= 0),
+            due_at TEXT,
+            CHECK((state = 'stopped') = (phase = 'stopped')),
+            CHECK((phase = 'waiting') = (due_at IS NOT NULL))
+        )"""
+    )
     connection.commit()
     return connection
 
@@ -500,12 +517,85 @@ def run_targets(connection: sqlite3.Connection, workers: int = 4,
     return sorted(results, key=lambda row: row["target"])
 
 
+def _now() -> datetime:
+    """Return the current time in UTC. Tests replace this to pin a beat."""
+    return datetime.now(timezone.utc)
+
+
+def _save_watcher(connection: sqlite3.Connection, *, state: str, phase: str, interval: float,
+                  started_at: str, rounds: int, due_in: float | None) -> None:
+    """Replace the single watcher row. `due_in` is the wait, measured from this beat."""
+    beat_at = _now()
+    due_at = None if due_in is None else (beat_at + timedelta(seconds=due_in)).isoformat()
+    with connection:
+        connection.execute(
+            """INSERT INTO watcher (id, state, phase, interval, started_at, beat_at, rounds, due_at)
+               VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   state = excluded.state, phase = excluded.phase, interval = excluded.interval,
+                   started_at = excluded.started_at, beat_at = excluded.beat_at,
+                   rounds = excluded.rounds, due_at = excluded.due_at""",
+            (state, phase, interval, started_at, beat_at.isoformat(), rounds, due_at),
+        )
+
+
+def _parse_time(value, field: str) -> datetime:
+    """Return an aware timestamp, or raise ValueError if `field` is not one."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Watcher {field} must be a timestamp with a timezone.") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"Watcher {field} must be a timestamp with a timezone.")
+    return parsed
+
+
+def watcher_status(connection: sqlite3.Connection, now: datetime | None = None) -> dict:
+    """Report the latest watcher beat, and whether a wait has already passed.
+
+    `now` defaults to the current time. A database no watcher has written reads as
+    `absent`. `late` is true only while `waiting` after `due_at`.
+    """
+    if now is None:
+        now = _now()
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        raise ValueError("Watcher time must include a timezone.")
+    row = connection.execute(
+        "SELECT state, phase, interval, started_at, beat_at, rounds, due_at FROM watcher WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return {"state": "absent", "phase": None, "interval": None, "started_at": None, "beat_at": None,
+                "rounds": None, "due_at": None, "late": False, "quiet_seconds": None}
+    beat_at = _parse_time(row["beat_at"], "beat_at")
+    _parse_time(row["started_at"], "started_at")
+    if row["state"] not in ("running", "stopped") or row["phase"] not in ("checking", "waiting", "stopped"):
+        raise ValueError("Watcher state must be running or stopped.")
+    if (row["state"] == "stopped") != (row["phase"] == "stopped"):
+        raise ValueError("A stopped watcher must be in the stopped phase.")
+    due_at = row["due_at"]
+    late = False
+    if row["phase"] == "waiting":
+        if due_at is None:
+            raise ValueError("A waiting watcher must have a due time.")
+        late = now > _parse_time(due_at, "due_at")
+    elif due_at is not None:
+        raise ValueError("Only a waiting watcher has a due time.")
+    quiet = (now - beat_at).total_seconds()
+    return {
+        "state": row["state"], "phase": row["phase"], "interval": row["interval"],
+        "started_at": row["started_at"], "beat_at": row["beat_at"], "rounds": row["rounds"],
+        "due_at": due_at, "late": late, "quiet_seconds": 0 if quiet < 0 else int(quiet),
+    }
+
+
 def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
                   count: int | None = None, workers: int = 4, deadline: float | None = None):
     """Yield one batch of results per round, waiting `interval` seconds between rounds.
 
     Paused targets are left out of each round. The watcher stops when no targets
-    remain, and keeps waiting while every remaining target is paused.
+    remain, and keeps waiting while every remaining target is paused. Starting a
+    round, finishing its checks, waiting, and exiting each replace the heartbeat
+    that `watcher_status` reads.
     """
     if (isinstance(interval, bool) or not isinstance(interval, (int, float))
             or not math.isfinite(interval) or not 1 <= interval <= 86400):
@@ -515,17 +605,41 @@ def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("Workers must be between 1 and 32.")
     deadline = validate_deadline(deadline)
-    cycle = 0
-    while True:
-        # Stop only when nothing is saved. A round that checks nothing because every
-        # target is paused still waits, so unpausing one is picked up next round.
-        remaining = list_targets(connection)
-        results = run_targets(connection, workers, deadline)
-        cycle += 1
-        yield {"cycle": cycle, "results": results}
-        if not remaining or (count is not None and cycle >= count):
-            return
-        sleep(interval)
+    started_at = _now().isoformat()
+    rounds = 0
+    running = False
+
+    def beat(state: str, phase: str, due_in: float | None = None) -> None:
+        _save_watcher(connection, state=state, phase=phase, interval=interval,
+                      started_at=started_at, rounds=rounds, due_in=due_in)
+
+    try:
+        beat("running", "checking")
+        running = True
+        while True:
+            # Stop only when nothing is saved. A round that checks nothing because every
+            # target is paused still waits, so unpausing one is picked up next round.
+            remaining = list_targets(connection)
+            results = run_targets(connection, workers, deadline)
+            rounds += 1
+            # Move the beat to the end of the checks. A probe that hangs keeps the beat
+            # from the start of the round. Alerts run after the yield, still `checking`,
+            # because a delivery has no promised end either.
+            beat("running", "checking")
+            yield {"cycle": rounds, "results": results}
+            if not remaining or (count is not None and rounds >= count):
+                return
+            beat("running", "waiting", interval)
+            sleep(interval)
+            beat("running", "checking")
+    finally:
+        # Any exit Python unwinds (the count, no targets left, Ctrl+C, SIGTERM, an
+        # error) is a stop. A kill that does not unwind leaves the last beat in place.
+        if running:
+            try:
+                beat("stopped", "stopped")
+            except sqlite3.Error:
+                pass
 
 
 class ShutdownRequested(BaseException):
@@ -627,6 +741,7 @@ def parser() -> argparse.ArgumentParser:
     alert_log.add_argument("--skip-resolved", action="store_true",
                            help="With --pending, leave out incidents a watcher with --skip-resolved would skip")
     commands.add_parser("webhooks", help="Show each alert webhook's last success, last failure, and queued alerts")
+    commands.add_parser("watcher", help="Show whether the watcher is checking, waiting, late, or stopped")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=url_argument, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"), help="Only report open or resolved incidents")
@@ -686,6 +801,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "webhooks":
                 print(json.dumps(alerts.webhook_health(connection), indent=2))
+                return 0
+            if args.command == "watcher":
+                print(json.dumps(watcher_status(connection), indent=2))
                 return 0
             if args.command == "incidents":
                 results = list_incidents(

@@ -124,7 +124,8 @@ class ApiTests(unittest.TestCase):
         self.save("down")
         before = self.database.read_bytes()
         with patch("monitor.probe") as probe, patch("monitor.save") as save:
-            for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents", "/api/webhooks"):
+            for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents", "/api/webhooks",
+                         "/api/watcher"):
                 self.assertEqual(self.get(path)[0], 200)
         probe.assert_not_called()
         save.assert_not_called()
