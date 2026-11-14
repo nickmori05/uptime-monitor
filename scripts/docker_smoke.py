@@ -249,7 +249,7 @@ def main():
         heartbeat = json.loads(command("watcher"))
         assert (heartbeat["state"], heartbeat["phase"], heartbeat["rounds"], heartbeat["interval"]) == (
             "stopped", "stopped", 1, 1), heartbeat
-        assert heartbeat["late"] is False and heartbeat["due_at"] is None, heartbeat
+        assert heartbeat["late"] is False and heartbeat["stale"] is False and heartbeat["due_at"] is None, heartbeat
         assert heartbeat["quiet_seconds"] >= 0, heartbeat
         served = json.loads(run(["exec", "-T", "fixture", "python", "-c", fetch, api + "/watcher"]))
         assert {key: served[key] for key in served if key != "quiet_seconds"} == {

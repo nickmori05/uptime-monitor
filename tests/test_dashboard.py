@@ -70,6 +70,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('id="watcher"', self.page)
         self.assertIn("No watcher has run.", self.page)
         self.assertIn("Watcher is late.", self.page)
+        self.assertIn("Watcher is stale.", self.page)
         self.assertIn("textContent", self.page)
         incidents = [path for path in paths if "incidents" in path]
         self.assertEqual(incidents, ["/api/incidents?state=open&limit=100"])

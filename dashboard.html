@@ -48,7 +48,7 @@ td.url { overflow-wrap: anywhere; min-width: 14em; }
 
 <p class="note">Saved observations from the last 100 checks per URL, refreshed every 30 seconds.
 Open incidents use each target's saved thresholds, the same ones alerts use.
-The watcher line reads the heartbeat from the last watch run: checking, waiting, late, or stopped.
+The watcher line reads the heartbeat from the last watch run: checking, waiting, late, stale, or stopped.
 A target marked (paused) is kept, with its settings and history, and is not checked until unpaused.
 Observations describe past checks, not whether an endpoint is up right now.</p>
 
@@ -92,17 +92,24 @@ function roundsText(count) {
   return `after ${count} rounds`;
 }
 
+function ago(seconds) {
+  return seconds === 1 ? "1 second" : `${seconds} seconds`;
+}
+
 function describeWatcher(watcher) {
   if (watcher.state === "absent") return ["No watcher has run.", ""];
   const beat = when(watcher.beat_at);
   if (watcher.state === "stopped") return [`Watcher stopped ${roundsText(watcher.rounds)}. Last beat ${beat}.`, ""];
+  if (watcher.stale) {
+    const overdue = watcher.late ? ` The next round was due ${when(watcher.due_at)}.` : "";
+    return [`Watcher is stale. Last beat ${ago(watcher.quiet_seconds)} ago.${overdue}`, "down"];
+  }
   if (watcher.late) return [`Watcher is late. The next round was due ${when(watcher.due_at)}.`, "down"];
   if (watcher.phase === "waiting") {
     return [`Watcher is waiting ${roundsText(watcher.rounds)}. Next round by ${when(watcher.due_at)}.`, "up"];
   }
-  const quiet = watcher.quiet_seconds === 1 ? "1 second" : `${watcher.quiet_seconds} seconds`;
   const progress = watcher.rounds === 0 ? "its first round" : roundsText(watcher.rounds);
-  return [`Watcher is checking ${progress}. Last beat ${quiet} ago.`, "up"];
+  return [`Watcher is checking ${progress}. Last beat ${ago(watcher.quiet_seconds)} ago.`, "up"];
 }
 
 function latest(summary) {
