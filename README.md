@@ -136,11 +136,14 @@ python3 monitor.py watcher
 ```json
 {"state": "running", "phase": "waiting", "interval": 30.0,
  "started_at": "2026-11-13T12:00:00+00:00", "beat_at": "2026-11-13T12:01:02+00:00",
- "rounds": 2, "due_at": "2026-11-13T12:01:32+00:00", "late": false, "quiet_seconds": 4}
+ "rounds": 2, "due_at": "2026-11-13T12:01:32+00:00", "late": false, "stale": false,
+ "quiet_seconds": 4}
 ```
 
 `watch` replaces one database row when it starts a round, when that round's checks
-finish, when the wait begins, and when it exits. `watcher` reads the row and
+finish, when the wait begins, and when it exits. While it runs, it also rewrites
+`beat_at` every 5 seconds, during a check, the alert delivery after a round,
+and the wait. That rewrite changes nothing else. `watcher` reads the row and
 makes no request. `state` is `absent` when no watcher has written it, `running`
 while one has, and `stopped` after an exit Python can unwind: the count was
 reached, no targets remain, Ctrl+C or SIGTERM, or a round raised. `phase` is
@@ -148,18 +151,25 @@ reached, no targets remain, Ctrl+C or SIGTERM, or a round raised. `phase` is
 after the checks is still `checking`, since a delivery has no promised end) and
 `waiting` during the interval. `rounds` counts rounds whose checks have
 finished. `due_at` is set only while `waiting`, and it is one interval after
-`beat_at`: the moment the next round's checks are due to start. `late` is true
+the beat that started the wait: the moment the next round's checks are due to
+start. Later beats during the wait do not move it. `late` is true
 only when that moment has passed. `quiet_seconds` is the whole seconds since
-`beat_at`, rounded down, or 0 when the clock is behind `beat_at`.
+`beat_at`, rounded down, or 0 when the clock is behind `beat_at`. `stale` is
+true when `state` is `running` and `quiet_seconds` is at least 15. A live
+watcher stays under that, because it beats every 5 seconds. A process that has
+died, or that can no longer write, crosses it. The two are separate: a wait can
+pass `due_at` while the process is still beating, and a process can go stale
+during a check, or during a wait that is not due yet.
 
 A round that checks nothing because every target is paused still beats, so the
 row shows the watcher is alive when history is not growing. `run` and `run-all`
 do not write it. The next `watch` replaces the row; it is the latest run, not a
 log of earlier ones. A kill that does not unwind (SIGKILL) leaves whatever beat
-was written last. That is `late` only if the watcher was already `waiting`.
-Killed during `checking`, it stays `checking` and `quiet_seconds` grows, which
-is also what a slow round looks like: a check without a deadline can sit in
-DNS, and a round of many slow checks has no promised end.
+was written last. That is `late` only if the watcher was already `waiting`, and
+it is `stale` once 15 seconds pass with no further beat, in either phase.
+A slow round that is still running keeps beating, so it is not `stale`: a check
+without a deadline can sit in DNS, and a round of many slow checks has no
+promised end, but the beat shows the process is still there.
 
 ### Incidents and summaries
 
@@ -369,7 +379,7 @@ unknown parameters return `400`, unknown paths `404`, and other methods `405`.
 `/` serves `dashboard.html`: a single static page that lists each target's
 latest result, recent up/down counts, average latency, incident thresholds,
 open incidents, and each alert webhook's health, says whether the watcher is
-checking, waiting, late, or stopped, and refreshes every 30 seconds.
+checking, waiting, late, stale, or stopped, and refreshes every 30 seconds.
 The open incidents are the ones `incidents` reports with no counts given, so
 they match alerts. The endpoints table shows each target's saved counts:
 `default` when both are unset, and otherwise that target's name with the counts
@@ -433,7 +443,10 @@ watcher still checks it. A database from before the watcher heartbeat gains an
 empty `watcher` table, which reads as `absent`.
 
 Requests run on worker threads while the calling thread does every database
-write, which keeps SQLite on one connection. Deadlines (and webhook deliveries)
+write, which keeps SQLite on one connection. The exception is the watcher
+pulse: while `watch` runs, a second connection on its own thread rewrites that
+row's `beat_at` every 5 seconds and then stops. It updates nothing else. `run`
+and `run-all` do not start it. Deadlines (and webhook deliveries)
 run the request on a daemon thread that is abandoned when time runs out, since
 a hung DNS lookup can't be cancelled; the abandoned thread finishes on its own
 socket timeout. The API opens the database read-only for each request, so it
@@ -466,7 +479,10 @@ settings and history stay, an older database gains the column unpaused, and an
 alert already owed is still sent),
 and reading the database while a check is committed, and the watcher heartbeat
 (a paused fleet still beats, a wait past `due_at` is `late`, a check in progress
-is not, `run` and `run-all` do not write the row, an older database reads as
+is not `late`, a running watcher quiet for 15 seconds is `stale` and one quiet
+for 14 is not, the beat keeps moving during a blocked check, a wait, and the
+gap while a round is handed back for alerts, and it stops moving once `watch`
+returns, `run` and `run-all` do not write the row, an older database reads as
 `absent`, and Ctrl+C or SIGTERM records `stopped`).
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
@@ -487,8 +503,8 @@ check while a target left at the default does not, until that override is
 cleared, and a paused target left out of `watch` and `run-all`, checked by
 `run` while it stays paused, then checked again on the next `watch` round after
 it is unpaused, and after that watch the `watcher` report is `stopped` with
-that one round, which `/api/watcher` agrees with. Everything it creates is
-removed afterward.
+that one round and not stale, which `/api/watcher` agrees with. Everything it
+creates is removed afterward.
 
 GitHub Actions runs `ruff check`, the unit tests and the reliability report on
 Python 3.10 and 3.14, and the Docker smoke test. Lint settings are in
@@ -546,11 +562,18 @@ same on every run; timings, and how many kills land and where, vary.
   one that ignores the key acts twice.
 - The watcher heartbeat is one row, replaced by the next `watch`, so it is not
   a history of runs. A second watcher on the same database overwrites it; run
-  one watcher per database. `late` means a wait has passed `due_at`. A round
-  that is still `checking` is never `late`: `quiet_seconds` grows for a healthy
-  slow round and for a process killed mid-round, and the report does not tell
-  those apart. `run` and `run-all` do not beat. A clock set back reports
-  `quiet_seconds` 0 and is not `late` until the clock passes `due_at`.
+  one watcher per database. While a watcher runs it rewrites `beat_at` every 5
+  seconds, so `quiet_seconds` stays small through a slow check, the alert
+  delivery after a round, and the wait. `stale` means a running watcher has
+  been quiet for 15 seconds: the process is gone, or it cannot write. `late`
+  means a wait has passed `due_at`. A live watcher can be late without being
+  stale, and a dead one can be stale before it is late. A round that is still
+  `checking` is never `late`. `run` and `run-all` do not beat. A clock set back
+  reports
+  `quiet_seconds` 0 and is neither `late` nor `stale` until the clock passes
+  `beat_at`. A machine that cannot run the pulse for 15 seconds looks stale
+  while it is still alive. The pulse does not say which check the round is on,
+  only that the process can still write.
 - Pausing a target keeps it out of `watch` and `run-all` until `update --unpause`.
   `run NAME` still checks it. A URL that another, unpaused target also checks is
   still checked. While a URL is not checked, an open incident stays open, and
@@ -620,3 +643,8 @@ and so are these:
    paused, a live watcher may save no checks, so the check history cannot show
    that it is still running, and a watcher that dies during its wait leaves
    those checks looking merely old.
+9. ~~Keep beating through a slow round, so a dead watcher is not mistaken for
+   one.~~ Done: while `watch` runs it rewrites `beat_at` every 5 seconds, and
+   `stale` is true once a running watcher has been quiet for 15 seconds. A
+   round that is still checking is never `late`; `stale` is how a beat that
+   has stopped shows up, including during a check and before a wait is due.

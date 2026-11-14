@@ -1,4 +1,4 @@
-"""The watcher heartbeat shows a live wait, and a wait that has already passed."""
+"""The watcher heartbeat shows a live wait, a missed one, and a beat that has stopped."""
 
 from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 import sqlite3
 import tempfile
-from threading import Thread
+import threading
+import time
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -46,6 +47,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(errors, "")
         self.assertEqual(json.loads(output), monitor.watcher_status(self.connection))
         self.assertEqual(json.loads(output)["state"], "absent")
+        self.assertIs(json.loads(output)["stale"], False)
         with patch.object(monitor, "probe", return_value=observation()), redirect_stdout(io.StringIO()):
             self.assertEqual(self.cli("run", "api")[0], 0)
             self.assertEqual(self.cli("run-all")[0], 0)
@@ -112,21 +114,26 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual([batch["results"] for batch in batches], [[], []])
         self.assertEqual(seen["checking"]["phase"], "checking")
         self.assertIs(seen["checking"]["late"], False)
+        self.assertIs(seen["checking"]["stale"], True)
         self.assertIsNone(seen["checking"]["due_at"])
         self.assertEqual(seen["checking"]["rounds"], 0)
         self.assertGreater(seen["checking"]["quiet_seconds"], 3600)
         self.assertEqual(seen["span"], timedelta(seconds=1.5))
         self.assertIs(seen["on_time"]["late"], False)
+        self.assertIs(seen["on_time"]["stale"], False)
         self.assertEqual(seen["on_time"]["quiet_seconds"], 1)
         self.assertIs(seen["late"]["late"], True)
+        self.assertIs(seen["late"]["stale"], False)
         self.assertEqual((seen["late"]["state"], seen["late"]["phase"], seen["late"]["rounds"]),
                          ("running", "waiting", 1))
         self.assertEqual(seen["behind"]["quiet_seconds"], 0)
         self.assertIs(seen["behind"]["late"], False)
+        self.assertIs(seen["behind"]["stale"], False)
         self.assertEqual(seen["cli"], (0, "waiting"))
         stopped = monitor.watcher_status(self.connection, now=WHEN + timedelta(days=1))
         self.assertEqual((stopped["state"], stopped["phase"], stopped["rounds"]), ("stopped", "stopped", 2))
         self.assertIs(stopped["late"], False)
+        self.assertIs(stopped["stale"], False)
 
     def test_a_paused_fleet_still_beats_and_an_empty_list_stops(self):
         monitor.update_target(self.connection, "api", paused=True)
@@ -158,7 +165,8 @@ class WatcherTests(unittest.TestCase):
                 before = len(monitor.history(self.connection))
                 self.assertEqual(self.cli("watch", "--interval", "30")[0], code)
                 status = monitor.watcher_status(self.connection)
-                self.assertEqual((status["state"], status["rounds"], status["late"]), ("stopped", 1, False))
+                self.assertEqual((status["state"], status["rounds"], status["late"], status["stale"]),
+                                 ("stopped", 1, False, False))
                 self.assertEqual(len(monitor.history(self.connection)), before + 1)
         with patch.object(monitor, "run_targets", side_effect=sqlite3.OperationalError("locked")), \
                 redirect_stderr(io.StringIO()):
@@ -204,7 +212,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_the_api_matches_the_report_and_does_not_write(self):
         server = api.make_server(self.database, "127.0.0.1", 0, monitor)
-        thread = Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
         self.addCleanup(thread.join)
@@ -228,12 +236,212 @@ class WatcherTests(unittest.TestCase):
             status, body = get("/api/watcher")
         self.assertEqual((status, body), (200, monitor.watcher_status(self.connection, now=fixed)))
         self.assertEqual(body["state"], "stopped")
+        self.assertIs(body["stale"], False)
         with self.connection:
             self.connection.execute("UPDATE watcher SET beat_at = 'yesterday'")
         with self.assertRaises(HTTPError) as failure:
             urlopen(base + "/api/watcher", timeout=5)
         self.assertEqual(failure.exception.code, 400)
         self.assertIn(b"beat_at", failure.exception.read())
+
+    def test_silence_is_stale_only_while_the_watcher_is_running(self):
+        self.assertEqual((monitor.PULSE_EVERY, monitor.STALE_AFTER), (5.0, 15))
+        beat = WHEN
+        due = beat + timedelta(seconds=30)
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO watcher (id, state, phase, interval, started_at, beat_at, rounds, due_at)
+                   VALUES (1, 'running', 'checking', 30, ?, ?, 1, NULL)""",
+                (beat.isoformat(), beat.isoformat()))
+
+        def at(seconds):
+            return monitor.watcher_status(self.connection, now=beat + timedelta(seconds=seconds))
+
+        self.assertEqual((at(14.9)["quiet_seconds"], at(14.9)["stale"], at(14.9)["late"]), (14, False, False))
+        self.assertEqual((at(15)["quiet_seconds"], at(15)["stale"], at(15)["late"]), (15, True, False))
+        behind = monitor.watcher_status(self.connection, now=beat - timedelta(seconds=5))
+        self.assertEqual((behind["quiet_seconds"], behind["stale"], behind["late"]), (0, False, False))
+        with self.connection:
+            self.connection.execute(
+                "UPDATE watcher SET phase = 'waiting', due_at = ? WHERE id = 1", (due.isoformat(),))
+        waiting = at(15)
+        self.assertEqual((waiting["phase"], waiting["stale"], waiting["late"]), ("waiting", True, False))
+        # A beat during the wait leaves the due time where it was, so the round can be late
+        # while the process is still writing.
+        fresh = due + timedelta(seconds=1)
+        with self.connection:
+            self.connection.execute("UPDATE watcher SET beat_at = ? WHERE id = 1", (fresh.isoformat(),))
+        overdue = monitor.watcher_status(self.connection, now=fresh + timedelta(seconds=1))
+        self.assertEqual((overdue["late"], overdue["stale"], overdue["quiet_seconds"], overdue["due_at"]),
+                         (True, False, 1, due.isoformat()))
+        with self.connection:
+            self.connection.execute(
+                "UPDATE watcher SET state = 'stopped', phase = 'stopped', due_at = NULL WHERE id = 1")
+        stopped = monitor.watcher_status(self.connection, now=fresh + timedelta(days=1))
+        self.assertEqual((stopped["state"], stopped["stale"], stopped["late"]), ("stopped", False, False))
+
+    def test_a_blocked_check_keeps_beating_and_a_finished_watch_does_not(self):
+        release, entered = threading.Event(), threading.Event()
+        errors = []
+
+        def probe(*_args):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("probe was not released")
+            return observation()
+
+        def run():
+            connection = monitor.connect(self.database)
+            try:
+                with patch.object(monitor, "probe", side_effect=probe), patch.object(monitor, "sleep"):
+                    list(monitor.watch_targets(connection, interval=30, count=1, workers=1, pulse_every=0.05))
+            except Exception as error:
+                errors.append(error)
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.addCleanup(lambda: (release.set(), worker.join(timeout=5)))
+        self.assertTrue(entered.wait(5))
+        first = self.read_watcher()
+        self.assertEqual((first["state"], first["phase"], first["rounds"], first["late"], first["stale"]),
+                         ("running", "checking", 0, False, False))
+        self.assertIsNone(first["due_at"])
+        moved = self.until_beat_moves(first["beat_at"])
+        self.assertEqual((moved["phase"], moved["rounds"], moved["started_at"], moved["due_at"]),
+                         ("checking", 0, first["started_at"], None))
+        self.assertIs(moved["stale"], False)
+        self.assertLess(moved["quiet_seconds"], monitor.STALE_AFTER)
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        stopped = self.read_watcher()
+        self.assertEqual((stopped["state"], stopped["stale"]), ("stopped", False))
+        time.sleep(0.25)
+        self.assertEqual(self.read_watcher()["beat_at"], stopped["beat_at"])
+        self.assertEqual(self.pulse_threads(), [])
+
+    def test_a_wait_keeps_its_due_time_while_the_beat_moves(self):
+        release, held = threading.Event(), threading.Event()
+        errors = []
+
+        def during_wait(seconds):
+            if seconds != 30:
+                raise AssertionError(f"wait was {seconds}, not 30")
+            held.set()
+            if not release.wait(5):
+                raise AssertionError("wait was not released")
+
+        def run():
+            connection = monitor.connect(self.database)
+            try:
+                with patch.object(monitor, "probe", return_value=observation()), \
+                        patch.object(monitor, "sleep", side_effect=during_wait):
+                    list(monitor.watch_targets(connection, interval=30, count=2, pulse_every=0.05))
+            except Exception as error:
+                errors.append(error)
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.addCleanup(lambda: (release.set(), worker.join(timeout=5)))
+        self.assertTrue(held.wait(5))
+        first = self.read_watcher()
+        self.assertEqual((first["state"], first["phase"], first["rounds"], first["late"]),
+                         ("running", "waiting", 1, False))
+        moved = self.until_beat_moves(first["beat_at"])
+        self.assertEqual((moved["phase"], moved["rounds"], moved["due_at"], moved["started_at"]),
+                         ("waiting", 1, first["due_at"], first["started_at"]))
+        self.assertIs(moved["stale"], False)
+        self.assertIs(moved["late"], False)
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.read_watcher()["state"], "stopped")
+        self.assertEqual(self.pulse_threads(), [])
+
+    def test_the_beat_moves_while_a_round_is_handed_back_for_alerts(self):
+        with patch.object(monitor, "probe", return_value=observation()), patch.object(monitor, "sleep"):
+            rounds = monitor.watch_targets(self.connection, interval=30, count=2, pulse_every=0.05)
+            self.addCleanup(rounds.close)
+            first = next(rounds)
+            self.assertEqual(first["cycle"], 1)
+            started = monitor.watcher_status(self.connection)
+            self.assertEqual((started["phase"], started["rounds"], started["stale"], started["due_at"]),
+                             ("checking", 1, False, None))
+            moved = self.until_beat_moves(started["beat_at"])
+            self.assertEqual((moved["phase"], moved["rounds"], moved["started_at"], moved["due_at"], moved["stale"]),
+                             ("checking", 1, started["started_at"], None, False))
+            second = next(rounds)
+            self.assertEqual(second["cycle"], 2)
+            with self.assertRaises(StopIteration):
+                next(rounds)
+        stopped = monitor.watcher_status(self.connection)
+        self.assertEqual((stopped["state"], stopped["rounds"], stopped["stale"]), ("stopped", 2, False))
+        time.sleep(0.25)
+        self.assertEqual(monitor.watcher_status(self.connection)["beat_at"], stopped["beat_at"])
+
+    def test_run_all_does_not_beat_while_a_check_blocks(self):
+        release, entered = threading.Event(), threading.Event()
+        errors = []
+
+        def probe(*_args):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("probe was not released")
+            return observation()
+
+        def run():
+            connection = monitor.connect(self.database)
+            try:
+                with patch.object(monitor, "probe", side_effect=probe):
+                    monitor.run_targets(connection, workers=1)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.addCleanup(lambda: (release.set(), worker.join(timeout=5)))
+        self.assertTrue(entered.wait(5))
+        self.assertEqual(self.pulse_threads(), [])
+        time.sleep(0.2)
+        self.assertEqual(self.read_watcher()["state"], "absent")
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.read_watcher()["state"], "absent")
+
+    def test_a_pulse_interval_outside_the_limit_is_rejected(self):
+        for value in (0, -1, True, float("nan"), monitor.PULSE_EVERY + 0.01):
+            with self.subTest(value=value), patch.object(monitor, "probe") as probe:
+                with self.assertRaises(ValueError):
+                    list(monitor.watch_targets(self.connection, pulse_every=value))
+                probe.assert_not_called()
+        self.assertEqual(monitor.watcher_status(self.connection)["state"], "absent")
+
+    def read_watcher(self):
+        with closing(api.read_only(self.database)) as reader:
+            return monitor.watcher_status(reader)
+
+    def pulse_threads(self):
+        return [thread.name for thread in threading.enumerate() if thread.name == "watcher-pulse"]
+
+    def until_beat_moves(self, previous):
+        deadline = time.perf_counter() + 3
+        last = None
+        while time.perf_counter() < deadline:
+            last = self.read_watcher()
+            if last["beat_at"] != previous:
+                return last
+            time.sleep(0.02)
+        self.fail(f"beat did not move from {previous}; last={last}")
 
 
 if __name__ == "__main__":

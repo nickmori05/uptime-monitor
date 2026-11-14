@@ -198,8 +198,9 @@ class WatchProcessTests(unittest.TestCase):
                     try:
                         self.assertEqual(len(monitor.history(connection)), 1)
                         status = monitor.watcher_status(connection)
-                        self.assertEqual((status["state"], status["phase"], status["rounds"], status["late"]),
-                                         ("stopped", "stopped", 1, False))
+                        self.assertEqual((status["state"], status["phase"], status["rounds"],
+                                          status["late"], status["stale"]),
+                                         ("stopped", "stopped", 1, False, False))
                         self.assertIsNone(status["due_at"])
                     finally:
                         connection.close()
