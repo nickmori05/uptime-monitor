@@ -267,11 +267,12 @@ def main():
             False, "stopped", False), stopped_health
         assert stopped_health["quiet_seconds"] >= 0, stopped_health
         health_py = (
-            "import json, sys, urllib.error, urllib.request\n"
+            "import sys, urllib.error, urllib.request\n"
             "try:\n"
             "    response = urllib.request.urlopen(sys.argv[1], timeout=2)\n"
-            "except urllib.error.HTTPError as response:\n"
-            "    pass\n"
+            "except urllib.error.HTTPError as error:\n"
+            "    # The name bound by `except` is cleared when the clause ends.\n"
+            "    response = error\n"
             "print(response.status)\n"
             "print(response.read().decode())\n"
         )
