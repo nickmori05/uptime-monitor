@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
 import threading
 from threading import Thread
@@ -217,6 +218,13 @@ class WatcherHealthTests(unittest.TestCase):
         status, body, _headers = get("/api/health")
         self.assertEqual(status, 400)
         self.assertIn("beat_at", body["error"])
+
+    def test_compose_probes_the_watcher_with_health(self):
+        compose = (Path(__file__).resolve().parents[1] / "compose.yml").read_text()
+        probe = json.loads(re.search(r"test: (\[.*\])", compose).group(1))
+        self.assertEqual(probe, ["CMD", "python", "monitor.py", "--database", "/data/checks.sqlite3", "health"])
+        for setting in ("interval: 15s", "timeout: 10s", "start_period: 15s", "retries: 3"):
+            self.assertIn(setting, compose)
 
     def test_an_unreadable_database_exits_two(self):
         self.connection.close()
