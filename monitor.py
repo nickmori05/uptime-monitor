@@ -631,6 +631,22 @@ def watcher_status(connection: sqlite3.Connection, now: datetime | None = None) 
     }
 
 
+def watcher_health(connection: sqlite3.Connection, now: datetime | None = None) -> dict:
+    """Say whether a watcher is running and has beaten within `STALE_AFTER` seconds.
+
+    `ok` is true only then. A wait past `due_at` stays ok: that is `late` on
+    `watcher_status`, and it means the next round is overdue, not that the
+    process has stopped writing. `now` is passed through to `watcher_status`.
+    """
+    status = watcher_status(connection, now)
+    return {
+        "ok": status["state"] == "running" and not status["stale"],
+        "state": status["state"],
+        "stale": status["stale"],
+        "quiet_seconds": status["quiet_seconds"],
+    }
+
+
 def watch_targets(connection: sqlite3.Connection, *, interval: float = 30.0,
                   count: int | None = None, workers: int = 4, deadline: float | None = None,
                   pulse_every: float = PULSE_EVERY):
@@ -802,6 +818,7 @@ def parser() -> argparse.ArgumentParser:
                            help="With --pending, leave out incidents a watcher with --skip-resolved would skip")
     commands.add_parser("webhooks", help="Show each alert webhook's last success, last failure, and queued alerts")
     commands.add_parser("watcher", help="Show whether the watcher is checking, waiting, late, stale, or stopped")
+    commands.add_parser("health", help="Exit 0 when the watcher is running and not stale")
     incidents = commands.add_parser("incidents", help="Report incidents from saved checks")
     incidents.add_argument("--url", type=url_argument, help="Only report this exact URL")
     incidents.add_argument("--state", choices=("open", "resolved"), help="Only report open or resolved incidents")
@@ -865,6 +882,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "watcher":
                 print(json.dumps(watcher_status(connection), indent=2))
                 return 0
+            if args.command == "health":
+                report = watcher_health(connection)
+                print(json.dumps(report, indent=2))
+                return 0 if report["ok"] else 1
             if args.command == "incidents":
                 results = list_incidents(
                     connection, url=args.url, state=args.state, limit=args.limit,
