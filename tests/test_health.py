@@ -7,9 +7,13 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+from threading import Thread
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
+import api
 import monitor
 
 URL = "https://example.com"
@@ -153,6 +157,66 @@ class WatcherHealthTests(unittest.TestCase):
         self.assertEqual(code, 1)
         stopped = json.loads(output)
         self.assertEqual((stopped["ok"], stopped["state"], stopped["stale"]), (False, "stopped", False))
+
+    def test_the_api_returns_200_while_the_watcher_beats_and_503_when_it_does_not(self):
+        server = api.make_server(self.database, "127.0.0.1", 0, monitor)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def get(path, method="GET"):
+            try:
+                with urlopen(Request(base + path, method=method), timeout=5) as response:
+                    return response.status, json.loads(response.read()), response.headers
+            except HTTPError as response:
+                with response:
+                    return response.code, json.loads(response.read()), response.headers
+
+        status, body, headers = get("/api/health")
+        self.assertEqual(status, 503)
+        self.assertEqual(body, {"ok": False, "state": "absent", "stale": False, "quiet_seconds": None})
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(get("/api/health?verbose=1")[0], 400)
+        self.assertIn("Unknown query parameter", get("/api/health?verbose=1")[1]["error"])
+        self.assertEqual(get("/api/health", method="POST")[0], 405)
+
+        self.save_beat(seconds_ago=3)
+        before = self.database.read_bytes()
+        with patch.object(monitor, "_now", return_value=WHEN), patch.object(monitor, "probe") as probe:
+            status, body, _headers = get("/api/health")
+        probe.assert_not_called()
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"ok": True, "state": "running", "stale": False, "quiet_seconds": 3})
+        self.assertEqual(self.database.read_bytes(), before)
+
+        due = (WHEN - timedelta(seconds=1)).isoformat()
+        self.save_beat(phase="waiting", due_at=due, seconds_ago=1)
+        with patch.object(monitor, "_now", return_value=WHEN):
+            status, body, _headers = get("/api/health")
+        self.assertEqual((status, body["ok"]), (200, True))
+        self.assertIs(monitor.watcher_status(self.connection, now=WHEN)["late"], True)
+
+        self.save_beat(seconds_ago=15)
+        with patch.object(monitor, "_now", return_value=WHEN):
+            status, body, _headers = get("/api/health")
+        self.assertEqual(status, 503)
+        self.assertEqual(body, {"ok": False, "state": "running", "stale": True, "quiet_seconds": 15})
+
+        self.save_beat(state="stopped", phase="stopped")
+        with patch.object(monitor, "_now", return_value=WHEN):
+            status, body, _headers = get("/api/health")
+        self.assertEqual(status, 503)
+        self.assertEqual((body["ok"], body["state"], body["stale"]), (False, "stopped", False))
+
+        with self.connection:
+            self.connection.execute("UPDATE watcher SET beat_at = 'yesterday'")
+        status, body, _headers = get("/api/health")
+        self.assertEqual(status, 400)
+        self.assertIn("beat_at", body["error"])
 
     def test_an_unreadable_database_exits_two(self):
         self.connection.close()
