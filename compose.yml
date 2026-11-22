@@ -13,6 +13,12 @@ services:
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 75s
+    healthcheck:
+      test: ["CMD", "python", "monitor.py", "--database", "/data/checks.sqlite3", "health"]
+      interval: 15s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
 
 volumes:
   monitor-data:

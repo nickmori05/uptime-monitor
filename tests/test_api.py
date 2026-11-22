@@ -127,6 +127,7 @@ class ApiTests(unittest.TestCase):
             for path in ("/api/targets", "/api/history", "/api/summary", "/api/incidents", "/api/webhooks",
                          "/api/watcher"):
                 self.assertEqual(self.get(path)[0], 200)
+            self.assertEqual(self.get("/api/health")[0], 503)
         probe.assert_not_called()
         save.assert_not_called()
         self.assertEqual(self.database.read_bytes(), before)

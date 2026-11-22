@@ -39,6 +39,7 @@ options.
 | `run NAME`, `run-all` | Check one or every saved target once. |
 | `watch` | Check every saved target in repeated rounds, optionally sending alerts. |
 | `history`, `summary`, `incidents`, `alerts`, `webhooks`, `watcher` | Report on saved results without making requests. |
+| `health` | Exit 0 when the watcher is running and not stale. |
 | `serve` | Serve the read-only JSON API and dashboard. |
 
 ### Checks
@@ -61,7 +62,7 @@ for headers. A check that passes its deadline is saved as `down` with the error
 
 Exit codes are shared by all commands: `0` success (or an `up` check), `1` a
 `down` check, `2` invalid input or a storage error, `130` Ctrl+C, and `143`
-SIGTERM.
+SIGTERM. `health` uses `1` when the watcher is missing, stopped, or stale.
 
 ### Targets
 
@@ -170,6 +171,35 @@ it is `stale` once 15 seconds pass with no further beat, in either phase.
 A slow round that is still running keeps beating, so it is not `stale`: a check
 without a deadline can sit in DNS, and a round of many slow checks has no
 promised end, but the beat shows the process is still there.
+
+### Whether the watcher is alive
+
+```sh
+python3 monitor.py health
+```
+
+```json
+{"ok": true, "state": "running", "stale": false, "quiet_seconds": 4}
+```
+
+`health` is the probe a supervisor can run. It exits `0` when `state` is
+`running` and `stale` is false, and `1` otherwise: no watcher has written a
+row, the last one stopped, or a running one has been quiet for 15 seconds.
+`quiet_seconds` is the same whole seconds `watcher` reports, or `null` when
+no watcher has run. A wait that is `late` is still `ok` while the beat is
+fresh. The next round is overdue, and the process is still writing; `late`
+shows on `watcher`, not in this result.
+
+It makes no request and does not change the heartbeat. A beat that is not a
+timestamp is an error and exits `2`, as it does for `watcher`.
+
+`GET /api/health` returns the same JSON. The status is `200` when `ok` is
+true and `503` when it is not. The path takes no parameters. It is read-only,
+like the other API paths, so a bad beat is `400` and a database that cannot
+be read is `500`. Use the command for the process that runs `watch`. Use the
+URL for a `serve` process on the same database. A `serve` process that is
+down does not answer; a `503` means that process is up and the watcher is not
+healthy.
 
 ### Incidents and summaries
 
@@ -375,6 +405,8 @@ token, so `/api/targets` shows a target's own webhook only as `"webhook"`, and
 `/api/webhooks` shows it as `"route": "webhook"` with its `host`. `paused` is
 included, the same `true` or `false` as the `targets` command. Invalid or
 unknown parameters return `400`, unknown paths `404`, and other methods `405`.
+`GET /api/health` returns the same JSON as `health`, with status `200` when
+the watcher is running and not stale and `503` otherwise.
 
 `/` serves `dashboard.html`: a single static page that lists each target's
 latest result, recent up/down counts, average latency, incident thresholds,
@@ -413,6 +445,13 @@ container itself. To send alerts, add `--alert-webhook URL` to the service
 `command` in `compose.yml`, or give targets their own webhooks, and add
 `--max-backoff SECONDS` there to back off from failing ones.
 
+The service runs `health` every 15 seconds
+(`python monitor.py --database /data/checks.sqlite3 health`), waits 15
+seconds before failed checks count, and is unhealthy after three failures.
+The check reads the volume, so it follows the watcher in that container.
+The image's default command is `--help` and the same image runs one-off
+commands, so the check is on this service rather than in the Dockerfile.
+
 ## Design
 
 - `monitor.py`: the command line, request probing, SQLite storage, targets,
@@ -422,7 +461,7 @@ container itself. To send alerts, add `--alert-webhook URL` to the service
 - `routing.py`: works out which webhooks each URL's alerts go to.
 - `webhooks.py`: saves each delivery attempt's outcome, works out backoff, and
   reports webhook health.
-- `api.py` and `dashboard.html`: the read-only HTTP API and the static dashboard.
+- `api.py` and `dashboard.html`: the read-only HTTP API, including `/api/health`, and the static dashboard.
 
 All state lives in one SQLite file with seven tables: `checks` (one row per
 observation), `targets`, `alerts` (one row per sent or skipped incident event,
@@ -483,7 +522,12 @@ is not `late`, a running watcher quiet for 15 seconds is `stale` and one quiet
 for 14 is not, the beat keeps moving during a blocked check, a wait, and the
 gap while a round is handed back for alerts, and it stops moving once `watch`
 returns, `run` and `run-all` do not write the row, an older database reads as
-`absent`, and Ctrl+C or SIGTERM records `stopped`).
+`absent`, and Ctrl+C or SIGTERM records `stopped`), and `health` (exit `0`
+only while a watcher is running and not stale, including a late wait; exit
+`1` when it is absent, stopped, or stale; exit `2` when the beat is not a
+timestamp or the database cannot be opened; the beat is left unchanged;
+`/api/health` is `200` or `503` for the same report, read-only, and `400`
+for a bad beat).
 
 `scripts/docker_smoke.py` needs Docker with Compose. It builds an isolated image
 and project, then checks failure and recovery against a fixture on an internal
@@ -503,7 +547,9 @@ check while a target left at the default does not, until that override is
 cleared, and a paused target left out of `watch` and `run-all`, checked by
 `run` while it stays paused, then checked again on the next `watch` round after
 it is unpaused, and after that watch the `watcher` report is `stopped` with
-that one round and not stale, which `/api/watcher` agrees with. Everything it
+that one round and not stale, which `/api/watcher` agrees with. `health`
+exits `0` while the detached watcher is running, and exits `1` after this
+stopped watch, when `/api/health` returns `503`. Everything it
 creates is removed afterward.
 
 GitHub Actions runs `ruff check`, the unit tests and the reliability report on
@@ -574,6 +620,13 @@ same on every run; timings, and how many kills land and where, vary.
   `beat_at`. A machine that cannot run the pulse for 15 seconds looks stale
   while it is still alive. The pulse does not say which check the round is on,
   only that the process can still write.
+- `health` and `/api/health` report that heartbeat, not whether a target is
+  up. They succeed only while a watcher is `running` and not `stale`. A
+  watcher that has not started, has stopped, or has been quiet for 15 seconds
+  fails the probe, and a late wait does not. Nothing restarts it. The Compose
+  check runs in the watcher container against that container's database; a
+  watcher using another file is invisible to it. `serve` answering `503` is
+  up; a `serve` process that has stopped does not answer.
 - Pausing a target keeps it out of `watch` and `run-all` until `update --unpause`.
   `run NAME` still checks it. A URL that another, unpaused target also checks is
   still checked. While a URL is not checked, an open incident stays open, and
@@ -648,3 +701,11 @@ and so are these:
    `stale` is true once a running watcher has been quiet for 15 seconds. A
    round that is still checking is never `late`; `stale` is how a beat that
    has stopped shows up, including during a check and before a wait is due.
+10. ~~Tell a supervisor whether the watcher is still alive.~~ Done: `health`
+    and `GET /api/health`. The command exits `0`, and the URL returns `200`,
+    only when the watcher is `running` and not `stale`. Otherwise the command
+    exits `1` and the URL returns `503`. A late wait is still healthy while
+    the beat is fresh. The Compose `monitor` service runs the command as its
+    health check. The written list ended at the beat. This follows that: a
+    beat that can go stale is something a supervisor can act on, and `watcher`
+    always exits `0`, so it cannot be that check.

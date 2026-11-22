@@ -81,6 +81,10 @@ def main():
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"Watcher did not produce its first batch: {logs}")
             time.sleep(0.2)
+        alive = json.loads(command("health"))
+        assert alive["ok"] is True and alive["state"] == "running" and alive["stale"] is False, alive
+        assert isinstance(alive["quiet_seconds"], int) and alive["quiet_seconds"] < 15, alive
+        print("Watcher health while running passed.", flush=True)
         run(["stop", "--timeout", "5", "monitor"])
         container = run(["ps", "--all", "--quiet", "monitor"]).strip()
         inspected = subprocess.run(["docker", "inspect", container], text=True, capture_output=True,
@@ -256,6 +260,27 @@ def main():
             key: heartbeat[key] for key in heartbeat if key != "quiet_seconds"}, (served, heartbeat)
         assert served["quiet_seconds"] >= heartbeat["quiet_seconds"], served
         print("Watcher heartbeat passed.", flush=True)
+
+        # That watcher has stopped, so the probe fails on the command and on the API.
+        stopped_health = json.loads(command("health", expected=1))
+        assert (stopped_health["ok"], stopped_health["state"], stopped_health["stale"]) == (
+            False, "stopped", False), stopped_health
+        assert stopped_health["quiet_seconds"] >= 0, stopped_health
+        health_py = (
+            "import sys, urllib.error, urllib.request\n"
+            "try:\n"
+            "    response = urllib.request.urlopen(sys.argv[1], timeout=2)\n"
+            "except urllib.error.HTTPError as error:\n"
+            "    # The name bound by `except` is cleared when the clause ends.\n"
+            "    response = error\n"
+            "print(response.status)\n"
+            "print(response.read().decode())\n"
+        )
+        reported = run(["exec", "-T", "fixture", "python", "-c", health_py, api + "/health"]).splitlines()
+        assert reported[0] == "503", reported
+        body = json.loads("".join(reported[1:]))
+        assert (body["ok"], body["state"], body["stale"]) == (False, "stopped", False), body
+        print("Watcher health when stopped passed.", flush=True)
     finally:
         subprocess.run(["docker", "rm", "--force", f"{project}-api"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)

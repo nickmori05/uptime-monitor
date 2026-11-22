@@ -75,6 +75,7 @@ def routes(store) -> dict:
         "/api/webhooks": ((), lambda connection, query: [routing.public_webhook(row)
                                                           for row in alerts.webhook_health(connection)]),
         "/api/watcher": ((), lambda connection, query: store.watcher_status(connection)),
+        "/api/health": ((), lambda connection, query: store.watcher_health(connection)),
     }
 
 
@@ -131,7 +132,9 @@ def make_server(database: Path, host: str, port: int, store) -> ThreadingHTTPSer
             except sqlite3.Error as error:
                 print(f"Storage error: {error}", file=sys.stderr)
                 return self.reply(500, {"error": "The database could not be read."})
-            self.reply(200, body)
+            # `/api/health` is a probe: 200 while the watcher is beating, 503 when it is not.
+            status = 503 if parts.path == "/api/health" and not body["ok"] else 200
+            self.reply(status, body)
 
         def refuse(self):
             self.reply(405, {"error": "The API is read-only; use GET."}, {"Allow": "GET"})
