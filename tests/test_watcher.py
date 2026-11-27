@@ -480,6 +480,86 @@ class WatcherTests(unittest.TestCase):
                 probe.assert_not_called()
         self.assertEqual(monitor.watcher_status(self.connection)["state"], "absent")
 
+    def test_a_second_watch_in_this_process_does_not_start(self):
+        release, entered = threading.Event(), threading.Event()
+        errors = []
+
+        def block(*_args):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("probe was not released")
+            return observation()
+
+        def run():
+            connection = monitor.connect(self.database)
+            try:
+                with patch.object(monitor, "probe", side_effect=block), patch.object(monitor, "sleep"):
+                    list(monitor.watch_targets(connection, interval=30, count=1, workers=1, pulse_every=0.05))
+            except Exception as error:
+                errors.append(error)
+            finally:
+                connection.close()
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.addCleanup(lambda: (release.set(), worker.join(timeout=5)))
+        self.assertTrue(entered.wait(5))
+        started = monitor.watcher_status(self.connection)["started_at"]
+        with patch.object(monitor, "probe") as probe:
+            with self.assertRaisesRegex(ValueError, "in this process"):
+                list(monitor.watch_targets(self.connection, interval=30, count=1))
+            probe.assert_not_called()
+        self.assertEqual(monitor.watcher_status(self.connection)["started_at"], started)
+        self.assertEqual(monitor.watcher_status(self.connection)["state"], "running")
+        release.set()
+        worker.join(5)
+        self.assertEqual(errors, [])
+        self.assertEqual(monitor.watcher_status(self.connection)["state"], "stopped")
+        self.assertEqual(self.pulse_threads(), [])
+
+    def test_a_held_lock_refuses_another_watch_and_a_released_one_does_not(self):
+        now = monitor._now().isoformat()
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO watcher (id, state, phase, interval, started_at, beat_at, rounds, due_at, pid)
+                   VALUES (1, 'running', 'checking', 30, ?, ?, 4, NULL, 4321)""",
+                (now, now))
+        held = monitor._try_watch_lock(self.database)
+        self.assertIsNotNone(held)
+        try:
+            with patch.object(monitor, "probe") as probe:
+                with self.assertRaisesRegex(ValueError, "pid 4321") as refused:
+                    list(monitor.watch_targets(self.connection, interval=5, count=1))
+                probe.assert_not_called()
+            self.assertIn("quiet for", str(refused.exception))
+            code, output, errors = self.cli("watch", "--interval", "5", "--count", "1")
+            self.assertEqual((code, output), (2, ""))
+            self.assertIn("pid 4321", errors)
+            self.assertEqual(monitor.watcher_status(self.connection)["rounds"], 4)
+        finally:
+            held.close()
+        # The beat is still fresh and names a pid, but nothing holds the lock, so this
+        # watch replaces it. That is a process that was killed without unwinding.
+        with patch.object(monitor, "probe", return_value=observation()), patch.object(monitor, "sleep"), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(self.cli("watch", "--interval", "5", "--count", "1")[0], 0)
+        status = monitor.watcher_status(self.connection)
+        self.assertEqual((status["state"], status["rounds"], status["pid"]), ("stopped", 1, os.getpid()))
+        self.assertTrue(monitor._watch_lock_path(self.database).is_file())
+
+    def test_a_lock_with_no_beat_still_refuses(self):
+        held = monitor._try_watch_lock(self.database)
+        self.assertIsNotNone(held)
+        try:
+            with patch.object(monitor, "probe") as probe:
+                with self.assertRaisesRegex(ValueError, "already running on this database") as refused:
+                    list(monitor.watch_targets(self.connection, interval=5, count=1))
+                probe.assert_not_called()
+            self.assertNotIn("pid", str(refused.exception))
+        finally:
+            held.close()
+        self.assertEqual(monitor.watcher_status(self.connection)["state"], "absent")
+
     def read_watcher(self):
         with closing(api.read_only(self.database)) as reader:
             return monitor.watcher_status(reader)

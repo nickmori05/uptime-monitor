@@ -205,6 +205,61 @@ class WatchProcessTests(unittest.TestCase):
                     finally:
                         connection.close()
 
+    def test_a_second_process_cannot_watch_until_the_first_is_gone(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), HealthyEndpoint)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "checks.sqlite3"
+            connection = monitor.connect(database)
+            try:
+                monitor.add_target(connection, "api", f"http://127.0.0.1:{server.server_port}")
+            finally:
+                connection.close()
+            command = [sys.executable, str(Path(monitor.__file__).resolve()), "--database", str(database)]
+            process = subprocess.Popen(
+                [*command, "watch", "--interval", "60"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(timeout=10), "watch did not stream its first batch")
+                batch = json.loads(process.stdout.readline())
+                self.assertEqual(batch["results"][0]["state"], "up")
+                second = subprocess.run([*command, "watch", "--interval", "60", "--count", "1"],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(second.returncode, 2, second.stderr)
+                self.assertEqual(second.stdout, "")
+                self.assertIn(f"pid {process.pid}", second.stderr)
+                connection = monitor.connect(database)
+                try:
+                    self.assertEqual(monitor.watcher_status(connection)["state"], "running")
+                finally:
+                    connection.close()
+                process.kill()
+                process.communicate(timeout=5)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=5)
+            # The kill does not unwind, so the beat is still fresh. The lock is gone
+            # with the process, and a new watch starts without waiting out the beat.
+            third = subprocess.run([*command, "watch", "--interval", "1", "--count", "1"],
+                                   capture_output=True, text=True, timeout=10)
+            self.assertEqual(third.returncode, 0, third.stderr)
+            self.assertIn('"cycle": 1', third.stdout)
+            connection = monitor.connect(database)
+            try:
+                status = monitor.watcher_status(connection)
+                self.assertEqual((status["state"], status["rounds"]), ("stopped", 1))
+                self.assertIsInstance(status["pid"], int)
+                self.assertNotEqual(status["pid"], process.pid)
+            finally:
+                connection.close()
+
 
 if __name__ == "__main__":
     unittest.main()
