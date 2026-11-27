@@ -63,6 +63,7 @@ for headers. A check that passes its deadline is saved as `down` with the error
 Exit codes are shared by all commands: `0` success (or an `up` check), `1` a
 `down` check, `2` invalid input or a storage error, `130` Ctrl+C, and `143`
 SIGTERM. `health` uses `1` when the watcher is missing, stopped, or stale.
+A second `watch` on a database one already holds also exits `2`.
 
 ### Targets
 
@@ -126,7 +127,8 @@ other terminals can add, update, remove, pause, or unpause them while it runs.
 `--count N` stops after N rounds, and the exit code is `1` if any round saw a
 failure. It stops when no targets remain. A round where every target is paused
 checks nothing, and the watcher keeps waiting, so unpausing one is picked up on
-the next round. Run one watcher per database.
+the next round. Only one `watch` can hold a database at a time; a second one
+exits `2`.
 
 ### Whether the watcher is running
 
@@ -138,14 +140,16 @@ python3 monitor.py watcher
 {"state": "running", "phase": "waiting", "interval": 30.0,
  "started_at": "2026-11-13T12:00:00+00:00", "beat_at": "2026-11-13T12:01:02+00:00",
  "rounds": 2, "due_at": "2026-11-13T12:01:32+00:00", "late": false, "stale": false,
- "quiet_seconds": 4}
+ "quiet_seconds": 4, "pid": 1234}
 ```
 
 `watch` replaces one database row when it starts a round, when that round's checks
 finish, when the wait begins, and when it exits. While it runs, it also rewrites
 `beat_at` every 5 seconds, during a check, the alert delivery after a round,
-and the wait. That rewrite changes nothing else. `watcher` reads the row and
-makes no request. `state` is `absent` when no watcher has written it, `running`
+and the wait. That rewrite changes nothing else, including `pid`. `watcher` reads the row and
+makes no request. `pid` is the process that wrote the row. It is null on a row
+saved before pids were recorded, and a stopped row keeps the pid of the process
+that exited. The number is the pid in that process's own namespace. `state` is `absent` when no watcher has written it, `running`
 while one has, and `stopped` after an exit Python can unwind: the count was
 reached, no targets remain, Ctrl+C or SIGTERM, or a round raised. `phase` is
 `checking` from the start of a round until the wait begins (the alert delivery
@@ -164,10 +168,22 @@ during a check, or during a wait that is not due yet.
 
 A round that checks nothing because every target is paused still beats, so the
 row shows the watcher is alive when history is not growing. `run` and `run-all`
-do not write it. The next `watch` replaces the row; it is the latest run, not a
-log of earlier ones. A kill that does not unwind (SIGKILL) leaves whatever beat
-was written last. That is `late` only if the watcher was already `waiting`, and
-it is `stale` once 15 seconds pass with no further beat, in either phase.
+do not write it. The row is the latest run, not a log of earlier ones. A kill
+that does not unwind (SIGKILL) leaves whatever beat was written last. That is
+`late` only if the watcher was already `waiting`, and it is `stale` once 15
+seconds pass with no further beat, in either phase.
+
+While `watch` runs it holds an exclusive lock on a file beside the database,
+named by adding `.watcher.lock` to the database path. A second `watch` on that
+file exits `2` and leaves the row alone. When the beat is `running` and has a
+pid, the message names that pid and how long it has been quiet. Two watches in
+one process are refused the same way. The lock is released after the stopped
+beat is written, and a kill releases it without that write, so a new `watch`
+can replace a killed watcher's row at once. It does not wait for the beat to
+go stale. The file can be left behind; it holds nothing, and the lock is the
+kernel's on this machine. Two machines that both open the file can both watch.
+`health` does not take the lock.
+
 A slow round that is still running keeps beating, so it is not `stale`: a check
 without a deadline can sit in DNS, and a round of many slow checks has no
 promised end, but the beat shows the process is still there.
@@ -411,7 +427,8 @@ the watcher is running and not stale and `503` otherwise.
 `/` serves `dashboard.html`: a single static page that lists each target's
 latest result, recent up/down counts, average latency, incident thresholds,
 open incidents, and each alert webhook's health, says whether the watcher is
-checking, waiting, late, stale, or stopped, and refreshes every 30 seconds.
+checking, waiting, late, stale, or stopped, shows its pid when one was recorded,
+and refreshes every 30 seconds.
 The open incidents are the ones `incidents` reports with no counts given, so
 they match alerts. The endpoints table shows each target's saved counts:
 `default` when both are unset, and otherwise that target's name with the counts
@@ -437,7 +454,9 @@ docker compose run --rm monitor incidents --state open
 The `monitor` service runs `watch --interval 30 --deadline 20` as a non-root
 user with a read-only filesystem, no capabilities, and no published ports. The
 database lives in the `monitor-data` volume, with its `-wal` and `-shm` files
-beside it. The volume survives `docker compose down` but not `down --volumes`.
+beside it. The watcher holds `checks.sqlite3.watcher.lock` on that volume, so
+`docker compose run` of `watch` while the service is up exits `2` and does not
+replace its beat. The volume survives `docker compose down` but not `down --volumes`.
 Add targets before starting it; the watcher exits
 when none remain. Compose allows 75 seconds for SIGTERM shutdown, which the
 20-second deadline stays well inside. Inside the container, `localhost` is the
@@ -470,8 +489,10 @@ unique per event), `deliveries` (one row per webhook route an event reached),
 any retry time),
 `alerting` (a single row saving the last check from before alerts were
 first enabled; every event after it is owed an alert),
-and `watcher` (a single row for the latest `watch` run, replaced when the next
-one starts).
+and `watcher` (a single row for the latest `watch` run, including the pid of
+the process that wrote it, replaced when the next one starts). A beat saved
+before pids were recorded gains a null pid. `watch` also holds an exclusive
+lock on a file beside the database until it exits; that file is not a table.
 Incidents and summaries are derived from `checks` on demand rather than stored,
 and checks are ordered by row ID rather than by timestamp, so a clock change
 can't reorder history. `connect` creates missing tables and columns, so
@@ -522,7 +543,11 @@ is not `late`, a running watcher quiet for 15 seconds is `stale` and one quiet
 for 14 is not, the beat keeps moving during a blocked check, a wait, and the
 gap while a round is handed back for alerts, and it stops moving once `watch`
 returns, `run` and `run-all` do not write the row, an older database reads as
-`absent`, and Ctrl+C or SIGTERM records `stopped`), and `health` (exit `0`
+`absent`, the row records the watcher's pid, an older beat has none, and a pid
+that is not a positive integer is an error, a second watch in the same process
+or one that finds the lock held exits without changing the row, and a watch
+whose process was killed can be replaced at once, and Ctrl+C or SIGTERM records
+`stopped`), and `health` (exit `0`
 only while a watcher is running and not stale, including a late wait; exit
 `1` when it is absent, stopped, or stale; exit `2` when the beat is not a
 timestamp or the database cannot be opened; the beat is left unchanged;
@@ -548,8 +573,9 @@ cleared, and a paused target left out of `watch` and `run-all`, checked by
 `run` while it stays paused, then checked again on the next `watch` round after
 it is unpaused, and after that watch the `watcher` report is `stopped` with
 that one round and not stale, which `/api/watcher` agrees with. `health`
-exits `0` while the detached watcher is running, and exits `1` after this
-stopped watch, when `/api/health` returns `503`. Everything it
+exits `0` while the detached watcher is running, a second `watch` in another
+container exits `2` and leaves that beat running, and `health` exits `1` after
+this stopped watch, when `/api/health` returns `503`. Everything it
 creates is removed afterward.
 
 GitHub Actions runs `ruff check`, the unit tests and the reliability report on
@@ -607,8 +633,14 @@ same on every run; timings, and how many kills land and where, vary.
   repeat has the same idempotency key, but dropping it is up to the receiver;
   one that ignores the key acts twice.
 - The watcher heartbeat is one row, replaced by the next `watch`, so it is not
-  a history of runs. A second watcher on the same database overwrites it; run
-  one watcher per database. While a watcher runs it rewrites `beat_at` every 5
+  a history of runs. A second `watch` exits `2` while the first holds the lock
+  beside the database, including another container on the same machine. The
+  lock does not cross machines: two hosts that open the same file can both
+  watch, and each will overwrite the row. A kill releases the lock without
+  writing `stopped`, so the next `watch` replaces a fresh beat. `pid` is the
+  process id in the watcher's own namespace, which is not the host's pid for a
+  container, and it is null on a row saved before pids were recorded. While a
+  watcher runs it rewrites `beat_at` every 5
   seconds, so `quiet_seconds` stays small through a slow check, the alert
   delivery after a round, and the wait. `stale` means a running watcher has
   been quiet for 15 seconds: the process is gone, or it cannot write. `late`
@@ -709,3 +741,11 @@ and so are these:
     health check. The written list ended at the beat. This follows that: a
     beat that can go stale is something a supervisor can act on, and `watcher`
     always exits `0`, so it cannot be that check.
+11. ~~Keep a second watch from replacing a live one's heartbeat.~~ Done:
+    while `watch` runs it holds an exclusive lock on a file beside the
+    database, and a second `watch` exits `2` without changing the row. The
+    message names the recorded pid when the beat has one. A kill releases
+    the lock, so the next `watch` can replace that beat at once. `watcher`
+    reports the pid. The written list ended at the health probe. This follows
+    that: the probe reads one row, and a second `watch` used to overwrite it
+    while the first was still beating.

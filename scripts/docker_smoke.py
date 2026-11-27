@@ -85,6 +85,11 @@ def main():
         assert alive["ok"] is True and alive["state"] == "running" and alive["stale"] is False, alive
         assert isinstance(alive["quiet_seconds"], int) and alive["quiet_seconds"] < 15, alive
         print("Watcher health while running passed.", flush=True)
+        # This container shares the volume, so the lock the service holds must keep it out.
+        command("watch", "--interval", "30", "--count", "1", expected=2)
+        still = json.loads(command("health"))
+        assert still["ok"] is True and still["state"] == "running" and still["stale"] is False, still
+        print("A second watch is refused while the first holds the lock.", flush=True)
         run(["stop", "--timeout", "5", "monitor"])
         container = run(["ps", "--all", "--quiet", "monitor"]).strip()
         inspected = subprocess.run(["docker", "inspect", container], text=True, capture_output=True,
