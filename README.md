@@ -138,14 +138,16 @@ python3 monitor.py watcher
 {"state": "running", "phase": "waiting", "interval": 30.0,
  "started_at": "2026-11-13T12:00:00+00:00", "beat_at": "2026-11-13T12:01:02+00:00",
  "rounds": 2, "due_at": "2026-11-13T12:01:32+00:00", "late": false, "stale": false,
- "quiet_seconds": 4}
+ "quiet_seconds": 4, "pid": 1234}
 ```
 
 `watch` replaces one database row when it starts a round, when that round's checks
 finish, when the wait begins, and when it exits. While it runs, it also rewrites
 `beat_at` every 5 seconds, during a check, the alert delivery after a round,
-and the wait. That rewrite changes nothing else. `watcher` reads the row and
-makes no request. `state` is `absent` when no watcher has written it, `running`
+and the wait. That rewrite changes nothing else, including `pid`. `watcher` reads the row and
+makes no request. `pid` is the process that wrote the row. It is null on a row
+saved before pids were recorded, and a stopped row keeps the pid of the process
+that exited. The number is the pid in that process's own namespace. `state` is `absent` when no watcher has written it, `running`
 while one has, and `stopped` after an exit Python can unwind: the count was
 reached, no targets remain, Ctrl+C or SIGTERM, or a round raised. `phase` is
 `checking` from the start of a round until the wait begins (the alert delivery

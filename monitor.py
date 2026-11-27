@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import http.client
 import json
 import math
+import os
 from pathlib import Path
 import re
 import signal
@@ -296,10 +297,14 @@ def connect(database: Path) -> sqlite3.Connection:
             beat_at TEXT NOT NULL,
             rounds INTEGER NOT NULL CHECK(rounds >= 0),
             due_at TEXT,
+            pid INTEGER CHECK(pid IS NULL OR pid > 0),
             CHECK((state = 'stopped') = (phase = 'stopped')),
             CHECK((phase = 'waiting') = (due_at IS NOT NULL))
         )"""
     )
+    # A beat saved before pids were recorded has a null pid.
+    if "pid" not in {row["name"] for row in connection.execute("PRAGMA table_info(watcher)")}:
+        connection.execute("ALTER TABLE watcher ADD COLUMN pid INTEGER CHECK(pid IS NULL OR pid > 0)")
     connection.commit()
     return connection
 
@@ -569,13 +574,13 @@ def _save_watcher(connection: sqlite3.Connection, *, state: str, phase: str, int
     due_at = None if due_in is None else (beat_at + timedelta(seconds=due_in)).isoformat()
     with connection:
         connection.execute(
-            """INSERT INTO watcher (id, state, phase, interval, started_at, beat_at, rounds, due_at)
-               VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO watcher (id, state, phase, interval, started_at, beat_at, rounds, due_at, pid)
+               VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET
                    state = excluded.state, phase = excluded.phase, interval = excluded.interval,
                    started_at = excluded.started_at, beat_at = excluded.beat_at,
-                   rounds = excluded.rounds, due_at = excluded.due_at""",
-            (state, phase, interval, started_at, beat_at.isoformat(), rounds, due_at),
+                   rounds = excluded.rounds, due_at = excluded.due_at, pid = excluded.pid""",
+            (state, phase, interval, started_at, beat_at.isoformat(), rounds, due_at, os.getpid()),
         )
 
 
@@ -595,24 +600,29 @@ def watcher_status(connection: sqlite3.Connection, now: datetime | None = None) 
 
     `now` defaults to the current time. A database no watcher has written reads as
     `absent`. `late` is true only while `waiting` after `due_at`. `stale` is true
-    when a running watcher has been quiet for `STALE_AFTER` seconds.
+    when a running watcher has been quiet for `STALE_AFTER` seconds. `pid` is the
+    process that wrote the row, or null when that row predates pids.
     """
     if now is None:
         now = _now()
     if not isinstance(now, datetime) or now.tzinfo is None:
         raise ValueError("Watcher time must include a timezone.")
     row = connection.execute(
-        "SELECT state, phase, interval, started_at, beat_at, rounds, due_at FROM watcher WHERE id = 1"
+        "SELECT state, phase, interval, started_at, beat_at, rounds, due_at, pid FROM watcher WHERE id = 1"
     ).fetchone()
     if row is None:
         return {"state": "absent", "phase": None, "interval": None, "started_at": None, "beat_at": None,
-                "rounds": None, "due_at": None, "late": False, "stale": False, "quiet_seconds": None}
+                "rounds": None, "due_at": None, "late": False, "stale": False, "quiet_seconds": None,
+                "pid": None}
     beat_at = _parse_time(row["beat_at"], "beat_at")
     _parse_time(row["started_at"], "started_at")
     if row["state"] not in ("running", "stopped") or row["phase"] not in ("checking", "waiting", "stopped"):
         raise ValueError("Watcher state must be running or stopped.")
     if (row["state"] == "stopped") != (row["phase"] == "stopped"):
         raise ValueError("A stopped watcher must be in the stopped phase.")
+    pid = row["pid"]
+    if pid is not None and (type(pid) is not int or pid <= 0):
+        raise ValueError("Watcher pid must be a positive integer.")
     due_at = row["due_at"]
     late = False
     if row["phase"] == "waiting":
@@ -627,7 +637,7 @@ def watcher_status(connection: sqlite3.Connection, now: datetime | None = None) 
         "state": row["state"], "phase": row["phase"], "interval": row["interval"],
         "started_at": row["started_at"], "beat_at": row["beat_at"], "rounds": row["rounds"],
         "due_at": due_at, "late": late, "stale": row["state"] == "running" and quiet_seconds >= STALE_AFTER,
-        "quiet_seconds": quiet_seconds,
+        "quiet_seconds": quiet_seconds, "pid": pid,
     }
 
 

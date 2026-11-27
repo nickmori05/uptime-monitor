@@ -4,6 +4,7 @@ from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -209,6 +210,58 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(monitor.history(upgraded)[0]["url"], URL)
         self.assertIn("watcher", {row["name"] for row in upgraded.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'")})
+        self.assertIn("pid", {row["name"] for row in upgraded.execute("PRAGMA table_info(watcher)")})
+
+    def test_a_watch_records_its_pid_and_an_older_beat_has_none(self):
+        with patch.object(monitor, "probe", return_value=observation()), patch.object(monitor, "sleep"), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(self.cli("watch", "--interval", "5", "--count", "1")[0], 0)
+        status = monitor.watcher_status(self.connection)
+        self.assertEqual((status["state"], status["pid"]), ("stopped", os.getpid()))
+        code, output, errors = self.cli("watcher")
+        self.assertEqual((code, errors, json.loads(output)["pid"]), (0, "", os.getpid()))
+
+        legacy_path = self.database.with_name("legacy-watcher.sqlite3")
+        with sqlite3.connect(legacy_path) as legacy:
+            legacy.execute(
+                """CREATE TABLE watcher (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    state TEXT NOT NULL, phase TEXT NOT NULL, interval REAL NOT NULL,
+                    started_at TEXT NOT NULL, beat_at TEXT NOT NULL, rounds INTEGER NOT NULL,
+                    due_at TEXT)""")
+            legacy.execute(
+                """INSERT INTO watcher (id, state, phase, interval, started_at, beat_at, rounds, due_at)
+                   VALUES (1, 'stopped', 'stopped', 30, ?, ?, 1, NULL)""",
+                (WHEN.isoformat(), WHEN.isoformat()))
+        legacy.close()
+        upgraded = monitor.connect(legacy_path)
+        self.addCleanup(upgraded.close)
+        status = monitor.watcher_status(upgraded, now=WHEN)
+        self.assertEqual((status["state"], status["pid"], status["rounds"]), ("stopped", None, 1))
+        with self.assertRaises(sqlite3.IntegrityError):
+            with upgraded:
+                upgraded.execute("UPDATE watcher SET pid = -1")
+        # A pid that bypassed the check is still refused when the row is read.
+        upgraded.execute("ALTER TABLE watcher RENAME TO watcher_saved")
+        upgraded.execute(
+            """CREATE TABLE watcher (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                state TEXT NOT NULL, phase TEXT NOT NULL, interval REAL NOT NULL,
+                started_at TEXT NOT NULL, beat_at TEXT NOT NULL, rounds INTEGER NOT NULL,
+                due_at TEXT, pid INTEGER)""")
+        upgraded.execute("INSERT INTO watcher SELECT * FROM watcher_saved")
+        upgraded.execute("DROP TABLE watcher_saved")
+        upgraded.commit()
+        with upgraded:
+            upgraded.execute("UPDATE watcher SET pid = 0")
+        with self.assertRaisesRegex(ValueError, "pid"):
+            monitor.watcher_status(upgraded)
+        output_buf, error_buf = io.StringIO(), io.StringIO()
+        with redirect_stdout(output_buf), redirect_stderr(error_buf):
+            code = monitor.main(["--database", str(legacy_path), "watcher"])
+        self.assertEqual(code, 2)
+        self.assertEqual(output_buf.getvalue(), "")
+        self.assertIn("pid", error_buf.getvalue())
 
     def test_the_api_matches_the_report_and_does_not_write(self):
         server = api.make_server(self.database, "127.0.0.1", 0, monitor)
@@ -305,8 +358,9 @@ class WatcherTests(unittest.TestCase):
         self.addCleanup(lambda: (release.set(), worker.join(timeout=5)))
         self.assertTrue(entered.wait(5))
         first = self.read_watcher()
-        self.assertEqual((first["state"], first["phase"], first["rounds"], first["late"], first["stale"]),
-                         ("running", "checking", 0, False, False))
+        self.assertEqual((first["state"], first["phase"], first["rounds"], first["late"], first["stale"],
+                          first["pid"]),
+                         ("running", "checking", 0, False, False, os.getpid()))
         self.assertIsNone(first["due_at"])
         moved = self.until_beat_moves(first["beat_at"])
         self.assertEqual((moved["phase"], moved["rounds"], moved["started_at"], moved["due_at"]),
